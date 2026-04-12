@@ -29,6 +29,7 @@ class FileMoverGitApp:
 
         self.source_var = tk.StringVar()
         self.dest_var = tk.StringVar()
+        self.dest_subfolder_var = tk.StringVar(value="")
         self.commit_prefix_var = tk.StringVar(value="")
         self.remote_branch_var = tk.StringVar(value="main")
         self.commit_each_batch_var = tk.BooleanVar(value=True)
@@ -56,6 +57,10 @@ class FileMoverGitApp:
         ttk.Label(source_frame, text="Destination repo folder:").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Entry(source_frame, textvariable=self.dest_var, width=85).grid(row=1, column=1, sticky="ew", padx=8)
         ttk.Button(source_frame, text="Browse", command=self.pick_dest).grid(row=1, column=2, padx=4)
+
+        ttk.Label(source_frame, text="Optional subfolder inside repo:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(source_frame, textvariable=self.dest_subfolder_var, width=85).grid(row=2, column=1, sticky="ew", padx=8)
+        ttk.Button(source_frame, text="Choose", command=self.pick_dest_subfolder).grid(row=2, column=2, padx=4)
 
         source_frame.columnconfigure(1, weight=1)
 
@@ -134,50 +139,77 @@ class FileMoverGitApp:
         if folder:
             self.dest_var.set(folder)
 
+    def pick_dest_subfolder(self) -> None:
+        repo_root = self.dest_var.get().strip()
+        if not repo_root:
+            messagebox.showerror("Pick repo first", "Please choose the destination repo folder first.")
+            return
+
+        chosen = filedialog.askdirectory(title="Select a subfolder inside the repo", initialdir=repo_root)
+        if chosen:
+            try:
+                relative = Path(chosen).resolve().relative_to(Path(repo_root).resolve())
+                self.dest_subfolder_var.set("" if str(relative) == "." else str(relative))
+            except ValueError:
+                messagebox.showerror("Invalid subfolder", "The selected folder must be inside the destination repo.")
+
     def scan_in_thread(self) -> None:
         threading.Thread(target=self.scan_and_preview, daemon=True).start()
 
     def move_in_thread(self) -> None:
         threading.Thread(target=self.move_and_push, daemon=True).start()
 
-    def validate_paths(self) -> tuple[Path, Path] | None:
+    def validate_paths(self) -> tuple[Path, Path, Path] | None:
         src = Path(self.source_var.get().strip())
-        dst = Path(self.dest_var.get().strip())
+        repo_root = Path(self.dest_var.get().strip())
+        subfolder_text = self.dest_subfolder_var.get().strip()
 
         if not src.exists() or not src.is_dir():
             messagebox.showerror("Invalid source", "Please choose a valid source folder.")
             return None
 
-        if not dst.exists() or not dst.is_dir():
+        if not repo_root.exists() or not repo_root.is_dir():
             messagebox.showerror("Invalid destination", "Please choose a valid destination folder.")
             return None
 
-        git_dir = dst / ".git"
+        git_dir = repo_root / ".git"
         if not git_dir.exists() or not git_dir.is_dir():
             messagebox.showerror("Not a Git repo", "Destination folder must already contain a .git folder.")
             return None
 
         try:
-            src.resolve().relative_to(dst.resolve())
-            messagebox.showerror("Invalid folders", "Source folder cannot be inside destination folder.")
+            dest_subfolder = (repo_root / subfolder_text).resolve() if subfolder_text else repo_root.resolve()
+        except OSError as exc:
+            messagebox.showerror("Invalid subfolder", f"Could not resolve subfolder: {exc}")
+            return None
+
+        try:
+            dest_subfolder.relative_to(repo_root.resolve())
+        except ValueError:
+            messagebox.showerror("Invalid subfolder", "Subfolder must stay inside the destination repo.")
+            return None
+
+        try:
+            src.resolve().relative_to(dest_subfolder)
+            messagebox.showerror("Invalid folders", "Source folder cannot be inside destination target folder.")
             return None
         except ValueError:
             pass
 
         try:
-            dst.resolve().relative_to(src.resolve())
-            messagebox.showerror("Invalid folders", "Destination folder cannot be inside source folder.")
+            dest_subfolder.relative_to(src.resolve())
+            messagebox.showerror("Invalid folders", "Destination target folder cannot be inside source folder.")
             return None
         except ValueError:
             pass
 
-        return src, dst
+        return src, repo_root, dest_subfolder
 
     def scan_and_preview(self) -> None:
         validated = self.validate_paths()
         if not validated:
             return
-        src, _ = validated
+        src, _, _ = validated
 
         self.valid_files = []
         self.skipped_files = []
@@ -281,6 +313,7 @@ class FileMoverGitApp:
                 f"Skipped files: {skipped_count} ({self.human_size(self.total_skipped_size)})\n"
                 f"Folders discovered: {dir_count}\n"
                 f"Git batches needed: {batch_count}\n"
+                f"Target inside repo: {self.dest_subfolder_var.get().strip() or '.'}\n"
                 f"Limits: file <= 100 MB, batch <= 2 GB"
             )
         )
@@ -289,7 +322,7 @@ class FileMoverGitApp:
         validated = self.validate_paths()
         if not validated:
             return
-        src, dst = validated
+        src, repo_root, dst = validated
 
         if not self.valid_files:
             self.log("No scan data found. Running scan first...")
@@ -331,7 +364,7 @@ class FileMoverGitApp:
                 self.cleanup_empty_source_dirs(src)
 
                 commit_message = self.make_commit_message(batch_index, len(self.batches), moved_count, moved_bytes)
-                self.run_git_sequence(dst, commit_message)
+                self.run_git_sequence(repo_root, commit_message)
                 self.log(f"Finished batch {batch_index}.")
 
                 if not self.commit_each_batch_var.get() and batch_index < len(self.batches):
@@ -410,19 +443,33 @@ class FileMoverGitApp:
         now = datetime.now()
         timestamp = now.strftime("[%m][%d][%Y] [%H:%M:%S]")
         prefix = self.commit_prefix_var.get().strip()
-        details = f"batch {batch_index}/{total_batches} - {file_count} files - {self.human_size(moved_bytes)}"
-        if prefix:
-            return f"{prefix} {timestamp} {details}"
-        return f"{timestamp} {details}"
+
+        # Default fallback message if user provides nothing
+        base_message = prefix if prefix else "update"
+
+        # If multiple batches, increment message: update, update 2, update 3...
+        if total_batches > 1:
+            if batch_index == 1:
+                batch_suffix = ""
+            else:
+                batch_suffix = f" {batch_index}"
+        else:
+            batch_suffix = ""
+
+        final_message = f"{base_message}{batch_suffix}"
+
+        details = f"- {file_count} files - {self.human_size(moved_bytes)}"
+
+        return f"{timestamp} {final_message} {details}"
 
     def show_github_link(self, log_only: bool = False) -> None:
         validated = self.validate_paths()
         if not validated:
             return
-        _, dst = validated
+        _, repo_root, _ = validated
 
         try:
-            remote_url = self.run_command(["git", "remote", "get-url", "origin"], dst, capture_output=True)
+            remote_url = self.run_command(["git", "remote", "get-url", "origin"], repo_root, capture_output=True)
             http_url = self.normalize_github_url(remote_url)
             if http_url:
                 self.log(f"GitHub link: {http_url}")
