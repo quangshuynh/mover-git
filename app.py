@@ -9,9 +9,19 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlparse
 
+from PIL import Image
+from PIL.ExifTags import TAGS
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
 
 MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024          # 100 MB
 MAX_BATCH_SIZE_BYTES = 2 * 1024 * 1024 * 1024    # 2 GB
+
+MEDIA_FILE_TYPES = ('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov', '.avi', '.aae')
 
 
 @dataclass
@@ -25,7 +35,7 @@ class FileMoverGitApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("File Mover + Git Push")
-        self.root.geometry("980x760")
+        self.root.geometry("1040x860")
 
         self.source_var = tk.StringVar()
         self.dest_var = tk.StringVar()
@@ -34,6 +44,12 @@ class FileMoverGitApp:
         self.remote_branch_var = tk.StringVar(value="main")
         self.commit_each_batch_var = tk.BooleanVar(value=True)
         self.include_empty_dirs_var = tk.BooleanVar(value=True)
+
+        # New media organization options
+        self.organize_media_var = tk.BooleanVar(value=False)
+        self.media_use_date_folder_var = tk.BooleanVar(value=True)
+        self.media_rename_to_timestamp_var = tk.BooleanVar(value=True)
+        self.media_only_for_supported_types_var = tk.BooleanVar(value=True)
 
         self.valid_files: list[FileEntry] = []
         self.skipped_files: list[tuple[Path, int, str]] = []
@@ -84,6 +100,39 @@ class FileMoverGitApp:
             text="Recreate empty directories when possible",
             variable=self.include_empty_dirs_var,
         ).grid(row=1, column=2, columnspan=2, sticky="w", pady=4)
+
+        media_frame = ttk.LabelFrame(outer, text="Optional media organization", padding=10)
+        media_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Checkbutton(
+            media_frame,
+            text="Organize media by date taken / modified",
+            variable=self.organize_media_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Checkbutton(
+            media_frame,
+            text="Place organized media into YYYY-MM-DD subfolders",
+            variable=self.media_use_date_folder_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Checkbutton(
+            media_frame,
+            text="Rename organized media to timestamp",
+            variable=self.media_rename_to_timestamp_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Checkbutton(
+            media_frame,
+            text="Only apply organization to supported media types",
+            variable=self.media_only_for_supported_types_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Label(
+            media_frame,
+            text="Supported media types: " + ", ".join(MEDIA_FILE_TYPES),
+            foreground="gray"
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         buttons_frame = ttk.Frame(outer)
         buttons_frame.pack(fill="x", pady=(10, 0))
@@ -209,7 +258,7 @@ class FileMoverGitApp:
         validated = self.validate_paths()
         if not validated:
             return
-        src, _, _ = validated
+        src, _, dst = validated
 
         self.valid_files = []
         self.skipped_files = []
@@ -256,7 +305,7 @@ class FileMoverGitApp:
         self.skipped_files.sort(key=lambda x: str(x[0]).lower())
         self.batches = self.make_batches(self.valid_files)
 
-        self.write_preview(all_dirs)
+        self.write_preview(all_dirs, dst)
         self.log("Scan complete.")
 
     def make_batches(self, files: list[FileEntry]) -> list[list[FileEntry]]:
@@ -281,10 +330,13 @@ class FileMoverGitApp:
 
         return batches
 
-    def write_preview(self, all_dirs: set[Path]) -> None:
+    def write_preview(self, all_dirs: set[Path], dst: Path) -> None:
         valid_lines = []
         for entry in self.valid_files:
-            valid_lines.append(f"{entry.rel_path}  |  {self.human_size(entry.size)}")
+            target_preview = self.build_target_path_preview(dst, entry)
+            valid_lines.append(
+                f"{entry.rel_path}  ->  {target_preview.relative_to(dst) if target_preview.is_relative_to(dst) else target_preview}  |  {self.human_size(entry.size)}"
+            )
         self.valid_text.insert("1.0", "\n".join(valid_lines) if valid_lines else "No valid files found.")
 
         skipped_lines = []
@@ -298,7 +350,11 @@ class FileMoverGitApp:
             batch_size = sum(x.size for x in batch)
             batch_lines.append(f"Batch {i}: {len(batch)} files, {self.human_size(batch_size)}")
             for entry in batch:
-                batch_lines.append(f"    {entry.rel_path}  |  {self.human_size(entry.size)}")
+                target_preview = self.build_target_path_preview(dst, entry)
+                shown_target = target_preview.relative_to(dst) if target_preview.is_relative_to(dst) else target_preview
+                batch_lines.append(
+                    f"    {entry.rel_path}  ->  {shown_target}  |  {self.human_size(entry.size)}"
+                )
             batch_lines.append("")
         self.batch_text.insert("1.0", "\n".join(batch_lines) if batch_lines else "No batches created.")
 
@@ -307,6 +363,8 @@ class FileMoverGitApp:
         valid_count = len(self.valid_files)
         batch_count = len(self.batches)
 
+        organize_text = "On" if self.organize_media_var.get() else "Off"
+
         self.summary_label.config(
             text=(
                 f"Valid files: {valid_count} ({self.human_size(self.total_valid_size)})\n"
@@ -314,9 +372,99 @@ class FileMoverGitApp:
                 f"Folders discovered: {dir_count}\n"
                 f"Git batches needed: {batch_count}\n"
                 f"Target inside repo: {self.dest_subfolder_var.get().strip() or '.'}\n"
+                f"Media organization: {organize_text}\n"
                 f"Limits: file <= 100 MB, batch <= 2 GB"
             )
         )
+
+    @staticmethod
+    def is_supported_media(path: Path) -> bool:
+        return path.suffix.lower() in MEDIA_FILE_TYPES
+
+    @staticmethod
+    def sanitize_timestamp_filename(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%d %H_%M_%S")
+
+    def get_media_datetime(self, file_path: Path) -> datetime:
+        try:
+            ext = file_path.suffix.lower()
+
+            if ext in ('.jpg', '.jpeg', '.png', '.heic'):
+                with Image.open(file_path) as image:
+                    exif_data = getattr(image, "_getexif", lambda: None)()
+                    if exif_data:
+                        for tag, value in exif_data.items():
+                            tag_name = TAGS.get(tag, tag)
+                            if tag_name == "DateTimeOriginal":
+                                return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+
+            elif ext in ('.mp4', '.mov', '.avi') and cv2 is not None:
+                # OpenCV is optional here; still falls back to modified time.
+                vid = cv2.VideoCapture(str(file_path))
+                if vid is not None:
+                    vid.release()
+                return datetime.fromtimestamp(file_path.stat().st_mtime)
+
+        except Exception:
+            pass
+
+        return datetime.fromtimestamp(file_path.stat().st_mtime)
+
+    def build_target_path(self, dst: Path, entry: FileEntry) -> Path:
+        original_target = dst / entry.rel_path
+
+        if not self.organize_media_var.get():
+            return original_target
+
+        if self.media_only_for_supported_types_var.get() and not self.is_supported_media(entry.src_path):
+            return original_target
+
+        dt_taken = self.get_media_datetime(entry.src_path)
+
+        if self.media_use_date_folder_var.get():
+            subfolder = dst / dt_taken.strftime("%Y-%m-%d")
+        else:
+            subfolder = original_target.parent
+
+        if self.media_rename_to_timestamp_var.get():
+            filename_base = self.sanitize_timestamp_filename(dt_taken)
+            candidate = subfolder / f"{filename_base}{entry.src_path.suffix}"
+        else:
+            candidate = subfolder / entry.src_path.name
+
+        counter = 1
+        final_target = candidate
+        while final_target.exists():
+            final_target = subfolder / f"{candidate.stem}_{counter}{candidate.suffix}"
+            counter += 1
+
+        return final_target
+
+    def build_target_path_preview(self, dst: Path, entry: FileEntry) -> Path:
+        """
+        Preview-only version that avoids checking real destination collisions repeatedly
+        against files that have not yet moved.
+        """
+        original_target = dst / entry.rel_path
+
+        if not self.organize_media_var.get():
+            return original_target
+
+        if self.media_only_for_supported_types_var.get() and not self.is_supported_media(entry.src_path):
+            return original_target
+
+        dt_taken = self.get_media_datetime(entry.src_path)
+
+        if self.media_use_date_folder_var.get():
+            subfolder = dst / dt_taken.strftime("%Y-%m-%d")
+        else:
+            subfolder = original_target.parent
+
+        if self.media_rename_to_timestamp_var.get():
+            filename_base = self.sanitize_timestamp_filename(dt_taken)
+            return subfolder / f"{filename_base}{entry.src_path.suffix}"
+
+        return subfolder / entry.src_path.name
 
     def move_and_push(self) -> None:
         validated = self.validate_paths()
@@ -342,33 +490,59 @@ class FileMoverGitApp:
             if self.include_empty_dirs_var.get():
                 self.create_empty_directories(src, dst)
 
-            for batch_index, batch in enumerate(self.batches, start=1):
-                self.log(f"Starting batch {batch_index}/{len(self.batches)}...")
+            if self.commit_each_batch_var.get():
+                for batch_index, batch in enumerate(self.batches, start=1):
+                    self.log(f"Starting batch {batch_index}/{len(self.batches)}...")
+                    moved_count = 0
+                    moved_bytes = 0
+
+                    for entry in batch:
+                        target_path = self.build_target_path(dst, entry)
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+                        if target_path.exists():
+                            raise FileExistsError(
+                                f"Destination already contains {target_path.relative_to(dst)}. "
+                                f"Remove or rename it before moving."
+                            )
+
+                        shutil.move(str(entry.src_path), str(target_path))
+                        moved_count += 1
+                        moved_bytes += entry.size
+                        self.log(f"Moved: {entry.rel_path} -> {target_path.relative_to(dst)}")
+
+                    self.cleanup_empty_source_dirs(src)
+
+                    commit_message = self.make_commit_message(batch_index, len(self.batches), moved_count, moved_bytes)
+                    self.run_git_sequence(repo_root, commit_message)
+                    self.log(f"Finished batch {batch_index}.")
+            else:
+                self.log("Commit-each-batch disabled. Moving all files first, then committing once...")
+
                 moved_count = 0
                 moved_bytes = 0
 
-                for entry in batch:
-                    target_path = dst / entry.rel_path
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                for batch_index, batch in enumerate(self.batches, start=1):
+                    self.log(f"Moving batch {batch_index}/{len(self.batches)}...")
+                    for entry in batch:
+                        target_path = self.build_target_path(dst, entry)
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
 
-                    if target_path.exists():
-                        raise FileExistsError(
-                            f"Destination already contains {entry.rel_path}. Remove or rename it before moving."
-                        )
+                        if target_path.exists():
+                            raise FileExistsError(
+                                f"Destination already contains {target_path.relative_to(dst)}. "
+                                f"Remove or rename it before moving."
+                            )
 
-                    shutil.move(str(entry.src_path), str(target_path))
-                    moved_count += 1
-                    moved_bytes += entry.size
-                    self.log(f"Moved: {entry.rel_path}")
+                        shutil.move(str(entry.src_path), str(target_path))
+                        moved_count += 1
+                        moved_bytes += entry.size
+                        self.log(f"Moved: {entry.rel_path} -> {target_path.relative_to(dst)}")
 
                 self.cleanup_empty_source_dirs(src)
-
-                commit_message = self.make_commit_message(batch_index, len(self.batches), moved_count, moved_bytes)
+                commit_message = self.make_commit_message(1, 1, moved_count, moved_bytes)
                 self.run_git_sequence(repo_root, commit_message)
-                self.log(f"Finished batch {batch_index}.")
-
-                if not self.commit_each_batch_var.get() and batch_index < len(self.batches):
-                    self.log("Commit-each-batch disabled, but batches still commit individually to respect 2 GB limit.")
+                self.log("Finished single commit/push for all moved files.")
 
             self.log("All batches completed successfully.")
             self.show_github_link(log_only=True)
@@ -444,20 +618,14 @@ class FileMoverGitApp:
         timestamp = now.strftime("[%m][%d][%Y] [%H:%M:%S]")
         prefix = self.commit_prefix_var.get().strip()
 
-        # Default fallback message if user provides nothing
         base_message = prefix if prefix else "update"
 
-        # If multiple batches, increment message: update, update 2, update 3...
         if total_batches > 1:
-            if batch_index == 1:
-                batch_suffix = ""
-            else:
-                batch_suffix = f" {batch_index}"
+            batch_suffix = "" if batch_index == 1 else f" {batch_index}"
         else:
             batch_suffix = ""
 
         final_message = f"{base_message}{batch_suffix}"
-
         details = f"- {file_count} files - {self.human_size(moved_bytes)}"
 
         return f"{timestamp} {final_message} {details}"
