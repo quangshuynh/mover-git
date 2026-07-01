@@ -45,7 +45,7 @@ class FileMoverGitApp:
         self.commit_each_batch_var = tk.BooleanVar(value=True)
         self.include_empty_dirs_var = tk.BooleanVar(value=True)
 
-        # New media organization options
+        # New media organization options 
         self.organize_media_var = tk.BooleanVar(value=False)
         self.media_use_date_folder_var = tk.BooleanVar(value=True)
         self.media_rename_to_timestamp_var = tk.BooleanVar(value=True)
