@@ -503,7 +503,7 @@ class FileMoverGitApp:
                         if target_path.exists():
                             raise FileExistsError(
                                 f"Destination already contains {target_path.relative_to(dst)}. "
-                                f"Remove or rename it before moving."
+                                f"Remove or rename {target_path.relative_to(dst)} from source before moving."
                             )
 
                         shutil.move(str(entry.src_path), str(target_path))
