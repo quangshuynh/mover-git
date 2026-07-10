@@ -595,6 +595,9 @@ class FileMoverGitApp:
                     self.run_git_sequence(repo_root, commit_message)
                     self.update_progress()
                     self.log(f"Finished batch {batch_index}.")
+                    self.current_batch = batch_index
+                    self.current_batch_files = self.current_batch_total
+                    self.update_progress()
             else:
                 self.log("Commit-each-batch disabled. Moving all files first, then committing once...")
 
