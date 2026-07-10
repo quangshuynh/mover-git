@@ -63,6 +63,10 @@ class FileMoverGitApp:
         self.current_batch = 0
         self.total_batches = 0
 
+        # current batch progress
+        self.current_batch_files = 0
+        self.current_batch_total = 0
+
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -166,7 +170,7 @@ class FileMoverGitApp:
             summary_container,
             justify="left",
             anchor="ne",
-            font=("Segoe UI", 10, "bold")
+            font=("Consolas", 10, "bold")
         )
         self.progress_label.pack(side="right", anchor="ne")
 
@@ -343,9 +347,9 @@ class FileMoverGitApp:
         self.progress_label.config(
             text=(
                 f"Batch: {self.current_batch}/{self.total_batches}\n"
-                f"Files Pushed: "
-                f"{self.total_files_pushed}/{len(self.valid_files)}\n"
-                f"{self.human_size(self.total_bytes_pushed)} / "
+                f"Batch Files: {self.current_batch_files}/{self.current_batch_total}\n\n"
+                f"Files Pushed: {self.total_files_pushed}/{len(self.valid_files)}\n"
+                f"Data Pushed: {self.human_size(self.total_bytes_pushed)} / "
                 f"{self.human_size(self.total_valid_size)}"
             )
         )
@@ -531,6 +535,14 @@ class FileMoverGitApp:
         if not confirm:
             return
         
+        # init progress variables
+        self.total_files_pushed = 0
+        self.total_bytes_pushed = 0
+        self.current_batch = 0
+        self.total_batches = len(self.batches)
+
+        self.update_progress()
+        
         #automatically switch to log tab
         self.notebook.select(3)
         self.root.update_idletasks()
@@ -541,6 +553,11 @@ class FileMoverGitApp:
 
             if self.commit_each_batch_var.get():
                 for batch_index, batch in enumerate(self.batches, start=1):
+                    # progress update for current batch
+                    self.current_batch = batch_index
+                    self.current_batch_files = 0
+                    self.current_batch_total = len(batch)
+                    self.update_progress()
                     self.log(f"Starting batch {batch_index}/{len(self.batches)}...")
                     moved_count = 0
                     moved_bytes = 0
@@ -558,12 +575,19 @@ class FileMoverGitApp:
                         shutil.move(str(entry.src_path), str(target_path))
                         moved_count += 1
                         moved_bytes += entry.size
+
+                        # progress update after each file move
+                        self.total_files_pushed += 1
+                        self.total_bytes_pushed += entry.size
+                        self.update_progress()
+
                         self.log(f"Moved: {entry.rel_path} -> {target_path.relative_to(dst)}")
 
                     self.cleanup_empty_source_dirs(src)
 
                     commit_message = self.make_commit_message(batch_index, len(self.batches), moved_count, moved_bytes)
                     self.run_git_sequence(repo_root, commit_message)
+                    self.update_progress()
                     self.log(f"Finished batch {batch_index}.")
             else:
                 self.log("Commit-each-batch disabled. Moving all files first, then committing once...")
@@ -572,6 +596,11 @@ class FileMoverGitApp:
                 moved_bytes = 0
 
                 for batch_index, batch in enumerate(self.batches, start=1):
+                    # progress update for current batch
+                    self.current_batch = batch_index
+                    self.current_batch_files = 0
+                    self.current_batch_total = len(batch)
+                    self.update_progress()
                     self.log(f"Moving batch {batch_index}/{len(self.batches)}...")
                     for entry in batch:
                         target_path = self.build_target_path(dst, entry)
@@ -586,13 +615,22 @@ class FileMoverGitApp:
                         shutil.move(str(entry.src_path), str(target_path))
                         moved_count += 1
                         moved_bytes += entry.size
+
+                        # progress update after each file move
+                        self.total_files_pushed += 1
+                        self.total_bytes_pushed += entry.size
+                        self.update_progress()
+
                         self.log(f"Moved: {entry.rel_path} -> {target_path.relative_to(dst)}")
 
                 self.cleanup_empty_source_dirs(src)
                 commit_message = self.make_commit_message(1, 1, moved_count, moved_bytes)
                 self.run_git_sequence(repo_root, commit_message)
+                self.update_progress()
                 self.log("Finished single commit/push for all moved files.")
-
+            
+            self.current_batch = self.total_batches
+            self.update_progress()
             self.log("All batches completed successfully.")
             self.show_github_link(log_only=True)
             messagebox.showinfo("Done", "Move and git push completed.")
