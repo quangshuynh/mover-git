@@ -159,6 +159,9 @@ class FileMoverGitApp:
         summary_frame.pack(fill="x", pady=(10, 0))
         summary_container = ttk.Frame(summary_frame)
         summary_container.pack(fill="x")
+
+        summary_container.columnconfigure(0, weight=1)
+        summary_container.columnconfigure(1, weight=0)
         # left side summmary label
         self.summary_label = ttk.Label(
             summary_container,
@@ -166,16 +169,16 @@ class FileMoverGitApp:
             text="No scan yet.",
             anchor="nw"
         )
-        self.summary_label.pack(side="left", anchor="nw")
+        self.summary_label.grid(row=0,column=0,sticky="nw")
 
         #  right side progress label
         self.progress_label = ttk.Label(
             summary_container,
             justify="left",
             anchor="ne",
-            font=("Consolas", 10, "bold")
+            font=("Segoe UI", 10, "bold")
         )
-        self.progress_label.pack(side="right", anchor="ne")
+        self.progress_label.grid(row=0,column=1,sticky="ne",padx=(30,0))
 
         preview_frame = ttk.LabelFrame(outer, text="Preview", padding=10)
         preview_frame.pack(fill="both", expand=True, pady=(10, 0))
@@ -352,11 +355,11 @@ class FileMoverGitApp:
         def _update():
             self.progress_label.config(
                 text=(
-                    f"Batch        : {self.current_batch}/{self.total_batches}\n"
-                    f"Batch Files  : {self.current_batch_files}/{self.current_batch_total}\n"
+                    f"Batch: {self.current_batch}/{self.total_batches}\n"
+                    f"Batch Files: {self.current_batch_files}/{self.current_batch_total}\n"
                     f"\n"
-                    f"Files Pushed : {self.total_files_pushed}/{len(self.valid_files)}\n"
-                    f"Data Pushed  : {self.human_size(self.total_bytes_pushed)} / "
+                    f"Files Pushed: {self.total_files_pushed}/{len(self.valid_files)}\n"
+                    f"Data Pushed: {self.human_size(self.total_bytes_pushed)} / "
                     f"{self.human_size(self.total_valid_size)}"
                 )
             )
