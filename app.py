@@ -347,10 +347,11 @@ class FileMoverGitApp:
     def update_progress(self):
         self.progress_label.config(
             text=(
-                f"Batch: {self.current_batch}/{self.total_batches}\n"
-                f"Batch Files: {self.current_batch_files}/{self.current_batch_total}\n\n"
-                f"Files Pushed: {self.total_files_pushed}/{len(self.valid_files)}\n"
-                f"Data Pushed: {self.human_size(self.total_bytes_pushed)} / "
+                f"Batch        : {self.current_batch}/{self.total_batches}\n"
+                f"Batch Files  : {self.current_batch_files}/{self.current_batch_total}\n"
+                f"\n"
+                f"Files Pushed : {self.total_files_pushed}/{len(self.valid_files)}\n"
+                f"Data Pushed  : {self.human_size(self.total_bytes_pushed)} / "
                 f"{self.human_size(self.total_valid_size)}"
             )
         )
@@ -586,6 +587,8 @@ class FileMoverGitApp:
 
                         self.log(f"Moved: {entry.rel_path} -> {target_path.relative_to(dst)}")
 
+                    self.current_batch_files = self.current_batch_total
+                    self.update_progress()
                     self.cleanup_empty_source_dirs(src)
 
                     commit_message = self.make_commit_message(batch_index, len(self.batches), moved_count, moved_bytes)
