@@ -57,6 +57,12 @@ class FileMoverGitApp:
         self.total_valid_size = 0
         self.total_skipped_size = 0
 
+        # progress variables
+        self.total_files_pushed = 0
+        self.total_bytes_pushed = 0
+        self.current_batch = 0
+        self.total_batches = 0
+
         self._build_ui()
 
     def _build_ui(self) -> None:
