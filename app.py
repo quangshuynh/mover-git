@@ -345,18 +345,19 @@ class FileMoverGitApp:
         self.update_progress()
 
     def update_progress(self):
-        self.progress_label.config(
-            text=(
-                f"Batch        : {self.current_batch}/{self.total_batches}\n"
-                f"Batch Files  : {self.current_batch_files}/{self.current_batch_total}\n"
-                f"\n"
-                f"Files Pushed : {self.total_files_pushed}/{len(self.valid_files)}\n"
-                f"Data Pushed  : {self.human_size(self.total_bytes_pushed)} / "
-                f"{self.human_size(self.total_valid_size)}"
+        def _update():
+            self.progress_label.config(
+                text=(
+                    f"Batch        : {self.current_batch}/{self.total_batches}\n"
+                    f"Batch Files  : {self.current_batch_files}/{self.current_batch_total}\n"
+                    f"\n"
+                    f"Files Pushed : {self.total_files_pushed}/{len(self.valid_files)}\n"
+                    f"Data Pushed  : {self.human_size(self.total_bytes_pushed)} / "
+                    f"{self.human_size(self.total_valid_size)}"
+                )
             )
-        )
 
-        self.root.update_idletasks()
+        self.root.after(0, _update)
         
 
     def make_batches(self, files: list[FileEntry]) -> list[list[FileEntry]]:
