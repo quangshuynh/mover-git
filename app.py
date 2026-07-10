@@ -152,7 +152,7 @@ class FileMoverGitApp:
         summary_frame.pack(fill="x", pady=(10, 0))
         summary_container = ttk.Frame(summary_frame)
         summary_container.pack(fill="x")
-
+        # left side summmary label
         self.summary_label = ttk.Label(
             summary_container,
             justify="left",
@@ -161,6 +161,7 @@ class FileMoverGitApp:
         )
         self.summary_label.pack(side="left", anchor="nw")
 
+        #  right side progress label
         self.progress_label = ttk.Label(
             summary_container,
             justify="left",
@@ -329,6 +330,28 @@ class FileMoverGitApp:
 
         self.write_preview(all_dirs, dst)
         self.log("Scan complete.")
+
+        # initialize progress after scan
+        self.total_files_pushed = 0
+        self.total_bytes_pushed = 0
+        self.current_batch = 0
+        self.total_batches = len(self.batches)
+
+        self.update_progress()
+
+    def update_progress(self):
+        self.progress_label.config(
+            text=(
+                f"Batch: {self.current_batch}/{self.total_batches}\n"
+                f"Files Pushed: "
+                f"{self.total_files_pushed}/{len(self.valid_files)}\n"
+                f"{self.human_size(self.total_bytes_pushed)} / "
+                f"{self.human_size(self.total_valid_size)}"
+            )
+        )
+
+        self.root.update_idletasks()
+        
 
     def make_batches(self, files: list[FileEntry]) -> list[list[FileEntry]]:
         batches: list[list[FileEntry]] = []
