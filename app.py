@@ -577,6 +577,7 @@ class FileMoverGitApp:
                         moved_bytes += entry.size
 
                         # progress update after each file move
+                        self.current_batch_files += 1
                         self.total_files_pushed += 1
                         self.total_bytes_pushed += entry.size
                         self.update_progress()
@@ -596,7 +597,6 @@ class FileMoverGitApp:
                 moved_bytes = 0
 
                 for batch_index, batch in enumerate(self.batches, start=1):
-                    # progress update for current batch
                     self.current_batch = batch_index
                     self.current_batch_files = 0
                     self.current_batch_total = len(batch)
@@ -617,6 +617,7 @@ class FileMoverGitApp:
                         moved_bytes += entry.size
 
                         # progress update after each file move
+                        self.current_batch_files += 1
                         self.total_files_pushed += 1
                         self.total_bytes_pushed += entry.size
                         self.update_progress()
@@ -630,6 +631,11 @@ class FileMoverGitApp:
                 self.log("Finished single commit/push for all moved files.")
             
             self.current_batch = self.total_batches
+
+            if self.batches:
+                self.current_batch_total = len(self.batches[-1])
+                self.current_batch_files = self.current_batch_total
+
             self.update_progress()
             self.log("All batches completed successfully.")
             self.show_github_link(log_only=True)
