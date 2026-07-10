@@ -489,7 +489,12 @@ class FileMoverGitApp:
 
         return datetime.fromtimestamp(file_path.stat().st_mtime)
 
-    def build_target_path(self, dst: Path, entry: FileEntry) -> Path:
+    def build_target_path(
+        self,
+        dst: Path,
+        entry: FileEntry,
+        used_paths: set[Path],
+    ) -> Path:
         original_target = dst / entry.rel_path
 
         if not self.organize_media_var.get():
@@ -511,12 +516,14 @@ class FileMoverGitApp:
         else:
             candidate = subfolder / entry.src_path.name
 
-        counter = 1
         final_target = candidate
-        while final_target.exists():
+        counter = 1
+
+        while final_target.exists() or final_target in used_paths:
             final_target = subfolder / f"{candidate.stem}_{counter}{candidate.suffix}"
             counter += 1
 
+        used_paths.add(final_target)
         return final_target
 
     def build_target_path_preview(self, dst: Path, entry: FileEntry, used_paths: set[Path]) -> Path:
@@ -619,6 +626,7 @@ class FileMoverGitApp:
 
             if self.commit_each_batch_var.get():
                 for batch_index, batch in enumerate(self.batches, start=1):
+                    used_move_paths = set()
                     # progress update for current batch
                     self.current_batch = batch_index
                     self.current_batch_files = 0
@@ -629,7 +637,7 @@ class FileMoverGitApp:
                     moved_bytes = 0
 
                     for entry in batch:
-                        target_path = self.build_target_path(dst, entry)
+                        target_path = self.build_target_path(dst, entry, used_move_paths)
                         target_path.parent.mkdir(parents=True, exist_ok=True)
 
                         if target_path.exists():
@@ -668,13 +676,14 @@ class FileMoverGitApp:
                 moved_bytes = 0
 
                 for batch_index, batch in enumerate(self.batches, start=1):
+                    used_move_paths = set()
                     self.current_batch = batch_index
                     self.current_batch_files = 0
                     self.current_batch_total = len(batch)
                     self.update_progress()
                     self.log(f"Moving batch {batch_index}/{len(self.batches)}...")
                     for entry in batch:
-                        target_path = self.build_target_path(dst, entry)
+                        target_path = self.build_target_path(dst, entry, used_move_paths)
                         target_path.parent.mkdir(parents=True, exist_ok=True)
 
                         if target_path.exists():
