@@ -150,8 +150,24 @@ class FileMoverGitApp:
 
         summary_frame = ttk.LabelFrame(outer, text="Summary", padding=10)
         summary_frame.pack(fill="x", pady=(10, 0))
-        self.summary_label = ttk.Label(summary_frame, text="No scan yet.", justify="left")
-        self.summary_label.pack(anchor="w")
+        summary_container = ttk.Frame(summary_frame)
+        summary_container.pack(fill="x")
+
+        self.summary_label = ttk.Label(
+            summary_container,
+            justify="left",
+            text="No scan yet.",
+            anchor="nw"
+        )
+        self.summary_label.pack(side="left", anchor="nw")
+
+        self.progress_label = ttk.Label(
+            summary_container,
+            justify="left",
+            anchor="ne",
+            font=("Segoe UI", 10, "bold")
+        )
+        self.progress_label.pack(side="right", anchor="ne")
 
         preview_frame = ttk.LabelFrame(outer, text="Preview", padding=10)
         preview_frame.pack(fill="both", expand=True, pady=(10, 0))
