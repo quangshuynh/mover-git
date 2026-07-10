@@ -12,6 +12,9 @@ from urllib.parse import urlparse
 from PIL import Image
 from PIL.ExifTags import TAGS
 
+from pillow_heif import register_heif_opener
+register_heif_opener()
+
 try:
     import cv2
 except Exception:
@@ -198,12 +201,13 @@ class FileMoverGitApp:
         return text
 
     def log(self, message: str) -> None:
-        self.log_text.insert("end", message + "\n")
-        self.log_text.see("end")
-        self.root.update_idletasks()
+        def _log():
+            self.log_text.insert("end", message + "\n")
+            self.log_text.see("end")
+        self.root.after(0, _log)
 
     def clear_log(self) -> None:
-        self.log_text.delete("1.0", "end")
+        self.ui(self.log_text.delete, "1.0", "end")
 
     def pick_source(self) -> None:
         folder = filedialog.askdirectory(title="Select source folder")
@@ -218,7 +222,7 @@ class FileMoverGitApp:
     def pick_dest_subfolder(self) -> None:
         repo_root = self.dest_var.get().strip()
         if not repo_root:
-            messagebox.showerror("Pick repo first", "Please choose the destination repo folder first.")
+            self.show_error("Pick repo first", "Please choose the destination repo folder first.")
             return
 
         chosen = filedialog.askdirectory(title="Select a subfolder inside the repo", initialdir=repo_root)
@@ -227,7 +231,7 @@ class FileMoverGitApp:
                 relative = Path(chosen).resolve().relative_to(Path(repo_root).resolve())
                 self.dest_subfolder_var.set("" if str(relative) == "." else str(relative))
             except ValueError:
-                messagebox.showerror("Invalid subfolder", "The selected folder must be inside the destination repo.")
+                self.show_error("Invalid subfolder", "The selected folder must be inside the destination repo.")
 
     def scan_in_thread(self) -> None:
         threading.Thread(target=self.scan_and_preview, daemon=True).start()
@@ -241,40 +245,40 @@ class FileMoverGitApp:
         subfolder_text = self.dest_subfolder_var.get().strip()
 
         if not src.exists() or not src.is_dir():
-            messagebox.showerror("Invalid source", "Please choose a valid source folder.")
+            self.show_error("Invalid source", "Please choose a valid source folder.")
             return None
 
         if not repo_root.exists() or not repo_root.is_dir():
-            messagebox.showerror("Invalid destination", "Please choose a valid destination folder.")
+            self.show_error("Invalid destination", "Please choose a valid destination folder.")
             return None
 
         git_dir = repo_root / ".git"
         if not git_dir.exists() or not git_dir.is_dir():
-            messagebox.showerror("Not a Git repo", "Destination folder must already contain a .git folder.")
+            self.show_error("Not a Git repo", "Destination folder must already contain a .git folder.")
             return None
 
         try:
             dest_subfolder = (repo_root / subfolder_text).resolve() if subfolder_text else repo_root.resolve()
         except OSError as exc:
-            messagebox.showerror("Invalid subfolder", f"Could not resolve subfolder: {exc}")
+            self.show_error("Invalid subfolder", f"Could not resolve subfolder: {exc}")
             return None
 
         try:
             dest_subfolder.relative_to(repo_root.resolve())
         except ValueError:
-            messagebox.showerror("Invalid subfolder", "Subfolder must stay inside the destination repo.")
+            self.show_error("Invalid subfolder", "Subfolder must stay inside the destination repo.")
             return None
 
         try:
             src.resolve().relative_to(dest_subfolder)
-            messagebox.showerror("Invalid folders", "Source folder cannot be inside destination target folder.")
+            self.show_error("Invalid folders", "Source folder cannot be inside destination target folder.")
             return None
         except ValueError:
             pass
 
         try:
             dest_subfolder.relative_to(src.resolve())
-            messagebox.showerror("Invalid folders", "Destination target folder cannot be inside source folder.")
+            self.show_error("Invalid folders", "Destination target folder cannot be inside source folder.")
             return None
         except ValueError:
             pass
@@ -293,9 +297,9 @@ class FileMoverGitApp:
         self.total_valid_size = 0
         self.total_skipped_size = 0
 
-        self.valid_text.delete("1.0", "end")
-        self.skipped_text.delete("1.0", "end")
-        self.batch_text.delete("1.0", "end")
+        self.ui(self.valid_text.delete, "1.0", "end")
+        self.ui(self.skipped_text.delete, "1.0", "end")
+        self.ui(self.batch_text.delete, "1.0", "end")
 
         self.log("Scanning source folder...")
 
@@ -388,13 +392,22 @@ class FileMoverGitApp:
             valid_lines.append(
                 f"{entry.rel_path}  ->  {target_preview.relative_to(dst) if target_preview.is_relative_to(dst) else target_preview}  |  {self.human_size(entry.size)}"
             )
-        self.valid_text.insert("1.0", "\n".join(valid_lines) if valid_lines else "No valid files found.")
 
+        self.ui(
+            self.valid_text.insert,
+            "1.0",
+            "\n".join(valid_lines) if valid_lines else "No valid files found."
+        )
         skipped_lines = []
         for rel_path, size, reason in self.skipped_files:
             size_text = self.human_size(size) if size else "0 B"
             skipped_lines.append(f"{rel_path}  |  {size_text}  |  {reason}")
-        self.skipped_text.insert("1.0", "\n".join(skipped_lines) if skipped_lines else "No skipped files.")
+
+        self.ui(
+            self.skipped_text.insert,
+            "1.0",
+            "\n".join(skipped_lines) if skipped_lines else "No skipped files."
+        )
 
         batch_lines = []
         for i, batch in enumerate(self.batches, start=1):
@@ -407,7 +420,12 @@ class FileMoverGitApp:
                     f"    {entry.rel_path}  ->  {shown_target}  |  {self.human_size(entry.size)}"
                 )
             batch_lines.append("")
-        self.batch_text.insert("1.0", "\n".join(batch_lines) if batch_lines else "No batches created.")
+
+        self.ui(
+            self.batch_text.insert,
+            "1.0",
+            "\n".join(batch_lines) if batch_lines else "No batches created."
+        )
 
         dir_count = len([d for d in all_dirs if str(d) != "."])
         skipped_count = len(self.skipped_files)
@@ -416,7 +434,8 @@ class FileMoverGitApp:
 
         organize_text = "On" if self.organize_media_var.get() else "Off"
 
-        self.summary_label.config(
+        self.ui(
+            self.summary_label.config,
             text=(
                 f"Valid files: {valid_count} ({self.human_size(self.total_valid_size)})\n"
                 f"Skipped files: {skipped_count} ({self.human_size(self.total_skipped_size)})\n"
@@ -442,11 +461,11 @@ class FileMoverGitApp:
 
             if ext in ('.jpg', '.jpeg', '.png', '.heic'):
                 with Image.open(file_path) as image:
-                    exif_data = getattr(image, "_getexif", lambda: None)()
-                    if exif_data:
-                        for tag, value in exif_data.items():
-                            tag_name = TAGS.get(tag, tag)
-                            if tag_name == "DateTimeOriginal":
+                    exif = image.getexif()
+
+                    for field in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+                        for tag, value in exif.items():
+                            if TAGS.get(tag) == field:
                                 return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
 
             elif ext in ('.mp4', '.mov', '.avi') and cv2 is not None:
@@ -516,6 +535,31 @@ class FileMoverGitApp:
             return subfolder / f"{filename_base}{entry.src_path.suffix}"
 
         return subfolder / entry.src_path.name
+    
+    def show_info(self, title, message):
+        self.root.after(
+            0,
+            lambda: messagebox.showinfo(title, message)
+        )
+
+    def show_error(self, title, message):
+        self.root.after(
+            0,
+            lambda: messagebox.showerror(title, message)
+        )
+
+    def ask_yes_no(self, title, message):
+        result = []
+        event = threading.Event()
+
+        def ask():
+            result.append(messagebox.askyesno(title, message))
+            event.set()
+
+        self.root.after(0, ask)
+
+        event.wait()
+        return result[0]
 
     def move_and_push(self) -> None:
         validated = self.validate_paths()
@@ -530,7 +574,7 @@ class FileMoverGitApp:
                 self.log("Nothing to move.")
                 return
 
-        confirm = messagebox.askyesno(
+        confirm = self.ask_yes_no(
             "Confirm move",
             "This will move valid files to the destination repo and run git add/commit/push. Continue?",
         )
@@ -547,8 +591,8 @@ class FileMoverGitApp:
         self.update_progress()
         
         #automatically switch to log tab
-        self.notebook.select(3)
-        self.root.update_idletasks()
+        self.ui(self.notebook.select, 3)
+        self.ui(self.root.update_idletasks)
 
         try:
             if self.include_empty_dirs_var.get():
@@ -647,10 +691,10 @@ class FileMoverGitApp:
             self.update_progress()
             self.log("All batches completed successfully.")
             self.show_github_link(log_only=True)
-            messagebox.showinfo("Done", "Move and git push completed.")
+            self.show_info("Done", "Move and git push completed.")
         except Exception as exc:
             self.log(f"ERROR: {exc}")
-            messagebox.showerror("Error", str(exc))
+            self.show_error("Error", str(exc))
 
     def create_empty_directories(self, src: Path, dst: Path) -> None:
         for root_dir, dirnames, filenames in os.walk(src):
@@ -713,6 +757,9 @@ class FileMoverGitApp:
             )
 
         return stdout if capture_output else ""
+    
+    def ui(self, func, *args, **kwargs):
+        self.root.after(0, lambda: func(*args, **kwargs))
 
     def make_commit_message(self, batch_index: int, total_batches: int, file_count: int, moved_bytes: int) -> str:
         now = datetime.now()
@@ -743,15 +790,15 @@ class FileMoverGitApp:
             if http_url:
                 self.log(f"GitHub link: {http_url}")
                 if not log_only:
-                    messagebox.showinfo("GitHub Link", http_url)
+                    self.show_info("GitHub Link", http_url)
             else:
                 self.log(f"Remote origin URL: {remote_url}")
                 if not log_only:
-                    messagebox.showinfo("Remote URL", remote_url)
+                    self.show_info("Remote URL", remote_url)
         except Exception as exc:
             self.log(f"Could not determine GitHub link: {exc}")
             if not log_only:
-                messagebox.showerror("GitHub link error", str(exc))
+                self.show_error("GitHub link error", str(exc))
 
     @staticmethod
     def normalize_github_url(remote_url: str) -> str | None:
@@ -782,6 +829,7 @@ class FileMoverGitApp:
                 return f"{size:.2f} {unit}"
             size /= 1024
         return f"{size_bytes} B"
+        
 
 
 def main() -> None:
