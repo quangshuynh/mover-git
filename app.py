@@ -750,7 +750,7 @@ class FileMoverGitApp:
 
     def run_git_sequence(self, repo_path: Path, commit_message: str) -> None:
         self.run_command(["git", "status", "--short"], repo_path)
-        self.run_command(["git", "add", "-A"], repo_path)
+        self.run_command(["git", "add", "."], repo_path)
 
         status_after_add = self.run_command(["git", "status", "--short"], repo_path, capture_output=True)
         if not status_after_add.strip():
