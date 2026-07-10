@@ -150,13 +150,13 @@ class FileMoverGitApp:
         preview_frame = ttk.LabelFrame(outer, text="Preview", padding=10)
         preview_frame.pack(fill="both", expand=True, pady=(10, 0))
 
-        notebook = ttk.Notebook(preview_frame)
-        notebook.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(preview_frame)
+        self.notebook.pack(fill="both", expand=True)
 
-        self.valid_text = self._make_text_tab(notebook, "Valid files")
-        self.skipped_text = self._make_text_tab(notebook, "Skipped files")
-        self.batch_text = self._make_text_tab(notebook, "Batches")
-        self.log_text = self._make_text_tab(notebook, "Log")
+        self.valid_text = self._make_text_tab(self.notebook, "Valid files")
+        self.skipped_text = self._make_text_tab(self.notebook, "Skipped files")
+        self.batch_text = self._make_text_tab(self.notebook, "Batches")
+        self.log_text = self._make_text_tab(self.notebook, "Log")
 
     def _make_text_tab(self, notebook: ttk.Notebook, title: str) -> tk.Text:
         frame = ttk.Frame(notebook)
