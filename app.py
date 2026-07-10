@@ -340,7 +340,8 @@ class FileMoverGitApp:
         self.total_bytes_pushed = 0
         self.current_batch = 0
         self.total_batches = len(self.batches)
-
+        self.current_batch_files = 0
+        self.current_batch_total = 0
         self.update_progress()
 
     def update_progress(self):
