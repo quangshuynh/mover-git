@@ -386,9 +386,14 @@ class FileMoverGitApp:
         return batches
 
     def write_preview(self, all_dirs: set[Path], dst: Path) -> None:
+        used_preview_paths: set[Path] = set()
         valid_lines = []
         for entry in self.valid_files:
-            target_preview = self.build_target_path_preview(dst, entry)
+            target_preview = self.build_target_path_preview(
+                dst,
+                entry,
+                used_preview_paths,
+            )
             valid_lines.append(
                 f"{entry.rel_path}  ->  {target_preview.relative_to(dst) if target_preview.is_relative_to(dst) else target_preview}  |  {self.human_size(entry.size)}"
             )
@@ -414,7 +419,11 @@ class FileMoverGitApp:
             batch_size = sum(x.size for x in batch)
             batch_lines.append(f"Batch {i}: {len(batch)} files, {self.human_size(batch_size)}")
             for entry in batch:
-                target_preview = self.build_target_path_preview(dst, entry)
+                target_preview = self.build_target_path_preview(
+                    dst,
+                    entry,
+                    used_preview_paths,
+                )
                 shown_target = target_preview.relative_to(dst) if target_preview.is_relative_to(dst) else target_preview
                 batch_lines.append(
                     f"    {entry.rel_path}  ->  {shown_target}  |  {self.human_size(entry.size)}"
@@ -510,10 +519,10 @@ class FileMoverGitApp:
 
         return final_target
 
-    def build_target_path_preview(self, dst: Path, entry: FileEntry) -> Path:
+    def build_target_path_preview(self, dst: Path, entry: FileEntry, used_paths: set[Path]) -> Path:
         """
-        Preview-only version that avoids checking real destination collisions repeatedly
-        against files that have not yet moved.
+        Preview version that matches the actual move logic by tracking
+        filenames already assigned during this preview.
         """
         original_target = dst / entry.rel_path
 
@@ -532,9 +541,19 @@ class FileMoverGitApp:
 
         if self.media_rename_to_timestamp_var.get():
             filename_base = self.sanitize_timestamp_filename(dt_taken)
-            return subfolder / f"{filename_base}{entry.src_path.suffix}"
+            candidate = subfolder / f"{filename_base}{entry.src_path.suffix}"
+        else:
+            candidate = subfolder / entry.src_path.name
 
-        return subfolder / entry.src_path.name
+        final_target = candidate
+        counter = 1
+
+        while final_target.exists() or final_target in used_paths:
+            final_target = subfolder / f"{candidate.stem}_{counter}{candidate.suffix}"
+            counter += 1
+
+        used_paths.add(final_target)
+        return final_target
     
     def show_info(self, title, message):
         self.root.after(
