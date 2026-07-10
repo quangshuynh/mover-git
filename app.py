@@ -485,6 +485,10 @@ class FileMoverGitApp:
         )
         if not confirm:
             return
+        
+        #automatically switch to log tab
+        self.notebook.select(3)
+        self.root.update_idletasks()
 
         try:
             if self.include_empty_dirs_var.get():
