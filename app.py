@@ -1002,7 +1002,7 @@ class FileMoverGitApp:
         :return: Formatted commit message
         :exception: None
         """
-        now = datetime.vanow()
+        now = datetime.now()
         timestamp = now.strftime("[%m][%d][%Y] [%H:%M:%S]")
         prefix = self.commit_prefix_var.get().strip()
 
