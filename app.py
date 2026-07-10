@@ -358,7 +358,6 @@ class FileMoverGitApp:
             )
 
         self.root.after(0, _update)
-        
 
     def make_batches(self, files: list[FileEntry]) -> list[list[FileEntry]]:
         batches: list[list[FileEntry]] = []
