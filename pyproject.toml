@@ -20,7 +20,6 @@ dev = [
     "pytest>=8,<9",
     "ruff>=0.9,<1",
 ]
-video = ["opencv-python>=4.9,<5"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
