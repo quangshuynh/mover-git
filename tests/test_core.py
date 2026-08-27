@@ -1,8 +1,33 @@
+import os
+import sys
 from pathlib import Path
 
 import pytest
 
-from mover_git.core import FileEntry, human_size, make_batches, make_commit_message, validate_paths
+from mover_git.core import (
+    FileEntry,
+    human_size,
+    make_batches,
+    make_commit_message,
+    validate_git_repository,
+    validate_paths,
+)
+
+skip_as_root = pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="permission checks are unreliable on Windows or when running as root",
+)
+
+
+def make_repo(path: Path) -> Path:
+    """
+    create a minimal valid Git repository fixture
+    :param path: repository directory to initialize
+    :returns: the repository path
+    """
+    (path / ".git").mkdir(parents=True)
+    (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    return path
 
 
 def entry(name: str, size: int) -> FileEntry:
@@ -54,9 +79,8 @@ def test_validate_paths_accepts_repository_subfolder(tmp_path: Path) -> None:
         :returns: nothing
     """
     source = tmp_path / "source"
-    repo = tmp_path / "repo"
+    repo = make_repo(tmp_path / "repo")
     source.mkdir()
-    (repo / ".git").mkdir(parents=True)
     assert validate_paths(source, repo, "uploads") == (
         source.resolve(), repo.resolve(), (repo / "uploads").resolve()
     )
@@ -68,12 +92,116 @@ def test_validate_paths_rejects_nested_source(tmp_path: Path) -> None:
     :param tmp_path: temporary test directory
         :returns: nothing
     """
-    repo = tmp_path / "repo"
+    repo = make_repo(tmp_path / "repo")
     source = repo / "source"
-    (repo / ".git").mkdir(parents=True)
     source.mkdir()
     with pytest.raises(ValueError, match="source folder"):
         validate_paths(source, repo)
+
+
+def test_validate_git_repository_rejects_missing_destination(tmp_path: Path) -> None:
+    """
+    verify a destination that does not exist is rejected with a specific message
+    :param tmp_path: temporary test directory
+        :returns: nothing
+    """
+    with pytest.raises(ValueError, match="does not exist"):
+        validate_git_repository(tmp_path / "missing")
+
+
+def test_validate_git_repository_rejects_file_destination(tmp_path: Path) -> None:
+    """
+    verify a destination that is a file rather than a folder is rejected
+    :param tmp_path: temporary test directory
+        :returns: nothing
+    """
+    destination = tmp_path / "not_a_folder"
+    destination.write_text("nope")
+    with pytest.raises(ValueError, match="not a folder"):
+        validate_git_repository(destination)
+
+
+def test_validate_git_repository_rejects_non_git_folder(tmp_path: Path) -> None:
+    """
+    verify a plain folder without a .git entry is rejected
+    :param tmp_path: temporary test directory
+        :returns: nothing
+    """
+    destination = tmp_path / "plain"
+    destination.mkdir()
+    with pytest.raises(ValueError, match="must be a Git repository"):
+        validate_git_repository(destination)
+
+
+def test_validate_git_repository_rejects_git_dir_without_head(tmp_path: Path) -> None:
+    """
+    verify a .git directory missing required repository information is rejected
+    :param tmp_path: temporary test directory
+        :returns: nothing
+    """
+    destination = tmp_path / "broken"
+    (destination / ".git").mkdir(parents=True)
+    with pytest.raises(ValueError, match="could not be determined"):
+        validate_git_repository(destination)
+
+
+def test_validate_git_repository_accepts_valid_worktree_pointer(tmp_path: Path) -> None:
+    """
+    verify a .git file pointing at a real Git directory is accepted
+    :param tmp_path: temporary test directory
+        :returns: nothing
+    """
+    gitdir = tmp_path / "main_repo" / ".git" / "worktrees" / "feature"
+    gitdir.mkdir(parents=True)
+    destination = tmp_path / "feature_worktree"
+    destination.mkdir()
+    (destination / ".git").write_text(f"gitdir: {gitdir}\n")
+    validate_git_repository(destination)
+
+
+def test_validate_git_repository_rejects_broken_worktree_pointer(tmp_path: Path) -> None:
+    """
+    verify a .git file pointing at a missing Git directory is rejected
+    :param tmp_path: temporary test directory
+        :returns: nothing
+    """
+    destination = tmp_path / "feature_worktree"
+    destination.mkdir()
+    (destination / ".git").write_text(f"gitdir: {tmp_path / 'nonexistent'}\n")
+    with pytest.raises(ValueError, match="could not be determined"):
+        validate_git_repository(destination)
+
+
+def test_validate_git_repository_rejects_malformed_git_file(tmp_path: Path) -> None:
+    """
+    verify a .git file without a gitdir pointer is rejected
+    :param tmp_path: temporary test directory
+        :returns: nothing
+    """
+    destination = tmp_path / "malformed"
+    destination.mkdir()
+    (destination / ".git").write_text("not a pointer file")
+    with pytest.raises(ValueError, match="could not be determined"):
+        validate_git_repository(destination)
+
+
+@skip_as_root
+def test_validate_git_repository_reports_inaccessible_destination(tmp_path: Path) -> None:
+    """
+    verify a destination that cannot be read raises an access-specific message
+    :param tmp_path: temporary test directory
+        :returns: nothing
+    """
+    parent = tmp_path / "locked"
+    parent.mkdir()
+    destination = parent / "repo"
+    destination.mkdir()
+    os.chmod(parent, 0o000)
+    try:
+        with pytest.raises(ValueError, match="cannot be accessed"):
+            validate_git_repository(destination)
+    finally:
+        os.chmod(parent, 0o755)
 
 
 def test_make_commit_message_adds_later_batch_number() -> None:

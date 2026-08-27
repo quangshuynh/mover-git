@@ -65,10 +65,7 @@ def validate_paths(source: Path, repo: Path, subfolder: str = "") -> tuple[Path,
     """
     if not source.is_dir():
         raise ValueError("please choose a valid source folder")
-    if not repo.is_dir():
-        raise ValueError("please choose a valid destination folder")
-    if not (repo / ".git").exists():
-        raise ValueError("destination folder must be a Git repository")
+    validate_git_repository(repo)
     source = source.resolve()
     repo = repo.resolve()
     target = (repo / subfolder).resolve()
@@ -79,6 +76,57 @@ def validate_paths(source: Path, repo: Path, subfolder: str = "") -> tuple[Path,
     if target.is_relative_to(source):
         raise ValueError("destination target cannot be inside the source folder")
     return source, repo, target
+
+
+def validate_git_repository(repo: Path) -> None:
+    """
+    validate that a destination path is an accessible Git repository
+    :param repo: destination path to validate
+    """
+    try:
+        repo_exists = repo.exists()
+    except OSError as exc:
+        raise ValueError(f"destination folder cannot be accessed: {exc.strerror or exc}") from exc
+    if not repo_exists:
+        raise ValueError("destination folder does not exist")
+
+    try:
+        repo_is_dir = repo.is_dir()
+    except OSError as exc:
+        raise ValueError(f"destination folder cannot be accessed: {exc.strerror or exc}") from exc
+    if not repo_is_dir:
+        raise ValueError("destination path is not a folder")
+
+    git_entry = repo / ".git"
+    try:
+        git_exists = git_entry.exists()
+    except OSError as exc:
+        raise ValueError(f"destination repository cannot be accessed: {exc.strerror or exc}") from exc
+    if not git_exists:
+        raise ValueError("destination folder must be a Git repository")
+
+    if git_entry.is_file():
+        _validate_git_worktree_pointer(git_entry)
+    elif not (git_entry / "HEAD").exists():
+        raise ValueError("destination Git repository information could not be determined")
+
+
+def _validate_git_worktree_pointer(git_file: Path) -> None:
+    """
+    validate a .git worktree/submodule pointer file resolves to a real Git directory
+    :param git_file: .git file containing a gitdir pointer
+    """
+    try:
+        contents = git_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"destination repository cannot be accessed: {exc.strerror or exc}") from exc
+    if not contents.startswith("gitdir:"):
+        raise ValueError("destination Git repository information could not be determined")
+    gitdir = Path(contents.removeprefix("gitdir:").strip())
+    if not gitdir.is_absolute():
+        gitdir = git_file.parent / gitdir
+    if not gitdir.is_dir():
+        raise ValueError("destination Git repository information could not be determined")
 
 
 def make_commit_message(
