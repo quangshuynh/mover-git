@@ -13,11 +13,11 @@ Mover Git is a Python and Tkinter desktop utility that previews and moves files 
 ## Features
 
 - previews source files, destination paths, skipped files, and batch assignments before moving anything
-- skips symbolic links, unreadable files, and individual files larger than 100 MB
-- creates batches no larger than 2 GB while preserving file order
+- skips symbolic links, unreadable files, and individual files larger than 100 MiB
+- creates batches no larger than 200 MiB while preserving file order
 - optionally organizes supported photos and videos by date and timestamp
 - avoids destination filename collisions without overwriting existing files
-- blocks moves when the destination repository already has staged, unstaged, or untracked changes
+- preserves unrelated staged, unstaged, and untracked changes
 - stages only files moved by the current operation
 - keeps the interface responsive and reports progress, status, and Git output
 
@@ -38,13 +38,13 @@ Mover Git is a Python and Tkinter desktop utility that previews and moves files 
 5. Start the move and confirm the destructive operation.
 6. Review move, commit, and push progress in the log.
 
-Mover Git moves files rather than copying them. Keep backups of important source data and review every preview before confirming.
+Mover Git copies and hashes files first, then removes sources only after a verified push. Keep backups of important data.
 
 ## Safety
 
 The application validates paths, nesting, repository state, symbolic links, size limits, and destination collisions. Git staging uses explicit repository-relative pathspecs for files moved by Mover Git. It does not run `git add .`, reset unrelated work, or clean the repository.
 
-A Git or filesystem failure is reported in the application log. Files moved before a later Git failure remain in the destination so they can be recovered and committed manually.
+After interruption, retry Move + Git Push to resume journaled copies, commits, and unpublished history without duplicating commits. Conflicting or changed files require manual review.
 
 ## Media Organization
 
@@ -56,10 +56,10 @@ Media can be placed in `YYYY-MM-DD` folders and renamed as `YYYY-MM-DD HH_MM_SS.
 
 | Limit | Value |
 | --- | ---: |
-| Maximum individual file | 100 MB |
-| Maximum Git batch | 2 GB |
+| Maximum individual file | 100 MiB |
+| Maximum Git batch | 200 MiB |
 
-These are application limits, not guarantees that a Git hosting provider will accept a push. GitHub normally blocks files larger than 100 MiB and recommends Git LFS for large binary assets. Mover Git does not configure Git LFS, retry network failures, or provide transactional rollback.
+These are application limits, not guarantees that a Git hosting provider will accept a push. GitHub normally blocks files larger than 100 MiB and recommends Git LFS for large binary assets. Mover Git does not configure Git LFS. Pushes use a 1 GiB object budget, retry smaller commit steps up to four attempts, and verify remote refs. An existing commit exceeding the budget requires manual review; history is never rewritten automatically.
 
 ## Installation
 
@@ -80,7 +80,7 @@ Run the actual application entry point:
 python app.py
 ```
 
-The destination repository must be clean before a move. Mover Git commits each batch separately by default and pushes the selected branch to `origin`. Disabling per-batch commits moves all valid files first and creates one commit.
+Select the checked-out branch to publish to `origin`. Commits always stay within 200 MiB. The batch checkbox selects pushing after each batch or after all batches are committed. Sources remain until publication is verified.
 
 ## Development
 
