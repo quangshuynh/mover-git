@@ -17,7 +17,12 @@ from mover_git.core import (
     make_commit_message,
     validate_paths,
 )
-from mover_git.git import normalize_github_url, repo_relative_paths
+from mover_git.git import (
+    check_staging_support,
+    finish_pending_git,
+    normalize_github_url,
+    stage_commit_push,
+)
 from mover_git.media import (
     MEDIA_FILE_TYPES,
     build_target_path,
@@ -668,6 +673,17 @@ class FileMoverGitApp:
             return
         src, repo_root, dst = validated
 
+        try:
+            check_staging_support(repo_root)
+            if finish_pending_git(repo_root):
+                self.cleanup_empty_source_dirs(src)
+                self.scan_and_preview()
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+            self.set_status("Git work pending; retry Move + Git Push after fixing the error")
+            self.show_error("Git recovery", str(exc))
+            return
+
         if not self.valid_files:
             self.log("No scan data found. Running scan first...")
             self.scan_and_preview()
@@ -753,10 +769,10 @@ class FileMoverGitApp:
 
                     self.current_batch_files = self.current_batch_total
                     self.update_progress()
-                    self.cleanup_empty_source_dirs(src)
 
                     commit_message = self.make_commit_message(batch_index, len(self.batches), moved_count, moved_bytes)
                     self.run_git_sequence(repo_root, commit_message, moved_paths)
+                    self.cleanup_empty_source_dirs(src)
                     self.update_progress()
                     self.log(f"Finished batch {batch_index}.")
                     self.current_batch = batch_index
@@ -800,9 +816,9 @@ class FileMoverGitApp:
 
                         self.log(f"Moved: {entry.rel_path} -> {target_path.relative_to(dst)}")
 
-                self.cleanup_empty_source_dirs(src)
                 commit_message = self.make_commit_message(1, 1, moved_count, moved_bytes)
                 self.run_git_sequence(repo_root, commit_message, moved_paths)
+                self.cleanup_empty_source_dirs(src)
                 self.update_progress()
                 self.log("Finished single commit/push for all moved files.")
             
@@ -820,7 +836,7 @@ class FileMoverGitApp:
         except Exception as exc:
             self.log(f"ERROR: {exc}")
             self.set_status(f"Error: {exc}")
-            self.show_error("Error", str(exc))
+            self.show_error("Error", str(exc) + "\nRetry Move + Git Push to resume pending Git work.")
 
 
     def create_empty_directories(self, src: Path, dst: Path) -> None:
@@ -867,33 +883,10 @@ class FileMoverGitApp:
         :param moved_paths: paths moved by the application
         :returns: nothing
         """
-        pathspecs = repo_relative_paths(repo_path, moved_paths)
-        if not pathspecs:
-            self.log("No moved paths to stage; skipping commit and push.")
-            self.set_status("No Git changes to commit")
-            return
-        self.set_status("Adding moved files to Git")
-        self.run_command(["git", "add", "--", *pathspecs], repo_path)
-
-        self.set_status("Checking staged Git changes")
-        status_after_add = self.run_command(
-            ["git", "diff", "--cached", "--name-only", "--", *pathspecs],
-            repo_path,
-            capture_output=True,
-        )
-        if not status_after_add.strip():
-            self.log("No git changes detected after add; skipping commit/push.")
-            self.set_status("No Git changes to commit")
-            return
-
-        self.set_status("Committing Git changes")
-        self.run_command(
-            ["git", "commit", "-m", commit_message, "--", *pathspecs], repo_path
-        )
-        self.set_status("Pushing Git changes")
-        self.run_command(
-            ["git", "push", "-u", "origin", self.remote_branch_var.get().strip() or "main"],
-            repo_path,
+        self.set_status("Staging, committing, and pushing moved files")
+        stage_commit_push(
+            repo_path, moved_paths, commit_message,
+            self.remote_branch_var.get().strip() or "main",
         )
 
 
