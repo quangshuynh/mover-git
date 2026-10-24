@@ -1,7 +1,17 @@
+import hashlib
 import json
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
+
+from mover_git.core import MAX_BATCH_SIZE_BYTES, MAX_FILE_SIZE_BYTES, human_size
+
+PUSH_BUDGET_BYTES = 1024**3
+GIT_CONFIG = ["-c", "maintenance.auto=false", "-c", "gc.auto=0",
+              "-c", "core.bigFileThreshold=8m", "-c", "pack.windowMemory=64m",
+              "-c", "pack.threads=2"]
 
 
 def normalize_github_url(remote_url: str) -> str | None:
@@ -54,7 +64,7 @@ def repo_relative_paths(repo: Path, paths: list[Path]) -> list[str]:
 
 def _git(repo: Path, *args: str, data: bytes | None = None) -> bytes:
     result = subprocess.run(
-        ["git", *args],
+        ["git", *GIT_CONFIG, *args],
         cwd=repo,
         input=data,
         capture_output=True,
@@ -77,16 +87,150 @@ def pending_git_file(repo: Path) -> Path:
     return Path(git_dir) / "mover-pending.json"
 
 
-def finish_pending_git(repo: Path) -> bool:
+def write_journal(path: Path, state: dict) -> None:
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(state, stream, ensure_ascii=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def file_digest(path: Path) -> str:
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def remote_head(repo: Path, branch: str) -> str:
+    output = _git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+    return output.split()[0].decode("ascii") if output.strip() else ""
+
+
+def object_bytes(repo: Path, commit: str, previous: str) -> int:
+    """Stream object metadata through disk, never collect blobs or object lists in RAM."""
+    args = ["rev-list", "--objects", "--no-object-names", commit]
+    if previous:
+        args += ["--not", previous]
+    with tempfile.TemporaryFile() as objects, tempfile.TemporaryFile() as sizes:
+        for command, source, destination in (
+            (args, None, objects),
+            (["cat-file", "--batch-check=%(objecttype) %(objectsize)"], objects, sizes),
+        ):
+            result = subprocess.run(["git", *GIT_CONFIG, *command], cwd=repo,
+                                    stdin=source, stdout=destination, stderr=subprocess.PIPE)
+            if result.returncode:
+                raise RuntimeError(result.stderr.decode("utf-8", errors="replace"))
+            destination.seek(0)
+        total = 0
+        for line in sizes:
+            kind, size = line.split()
+            size = int(size)
+            if kind == b"blob" and size > MAX_FILE_SIZE_BYTES:
+                raise RuntimeError(
+                    f"Commit {commit[:8]} contains a blob exceeding GitHub's 100 MiB "
+                    "standard Git limit. Review unpublished history manually; no LFS was enabled."
+                )
+            # Include conservative per-object packing overhead, even for empty blobs.
+            total += size + 64
+        return total
+
+
+def push_unpublished(repo: Path, branch: str, progress=lambda message: None,
+                     budget: int = PUSH_BUDGET_BYTES, max_attempts: int = 4) -> None:
+    """Publish fast-forward checkpoints, using remote refs as durable acknowledgements."""
+    if not 0 < budget <= PUSH_BUDGET_BYTES or max_attempts < 1:
+        raise ValueError("Push budget must be at most 1 GiB and attempts must be positive")
+    _git(repo, "check-ref-format", f"refs/heads/{branch}")
+    head_result = subprocess.run(["git", "rev-parse", "--verify", "HEAD"],
+                                 cwd=repo, capture_output=True)
+    if head_result.returncode:
+        return
+    if _git(repo, "symbolic-ref", "--short", "HEAD").decode().strip() != branch:
+        raise RuntimeError(f"Switch to branch {branch} before publishing its commits")
+    target = head_result.stdout.decode().strip()
+    failures = 0
+    step_limit = None
+    while True:
+        previous = remote_head(repo, branch)
+        if previous == target:
+            return
+        if previous:
+            try:
+                _git(repo, "merge-base", "--is-ancestor", previous, target)
+            except RuntimeError as exc:
+                raise RuntimeError("Remote branch diverged or is unknown locally. Fetch and "
+                                   "review it before retrying; local commits are preserved.") from exc
+        revision = f"{previous}..{target}" if previous else target
+        checkpoint, count, total = "", 0, 0
+        # First-parent checkpoints include all side-branch objects at a merge.
+        with tempfile.TemporaryFile() as commits:
+            ancestry = ["--ancestry-path"] if previous else []
+            result = subprocess.run(
+                ["git", *GIT_CONFIG, "rev-list", "--reverse", "--first-parent", *ancestry, revision],
+                cwd=repo, stdout=commits, stderr=subprocess.PIPE,
+            )
+            if result.returncode:
+                raise RuntimeError(result.stderr.decode(errors="replace"))
+            commits.seek(0)
+            base = previous
+            for line in commits:
+                commit = line.decode().strip()
+                size = object_bytes(repo, commit, base)
+                if total + size > budget:
+                    if not count:
+                        raise RuntimeError(f"Commit {commit[:8]} needs {human_size(size)} of "
+                                           "objects, exceeding the 1 GiB push budget. Review "
+                                           "this commit manually; history was not rewritten.")
+                    break
+                total += size
+                checkpoint, base = commit, commit
+                count += 1
+                if step_limit and count >= step_limit:
+                    break
+        if not checkpoint:
+            raise RuntimeError("No publishable checkpoint; inspect local and remote history")
+        progress(f"Push: {count} commit(s), {human_size(total)} objects -> {checkpoint[:8]}")
+        error = "Remote verification did not match the pushed checkpoint"
+        try:
+            _git(repo, "-c", "push.followTags=false", "push", "--no-follow-tags",
+                 "origin", f"{checkpoint}:refs/heads/{branch}")
+        except RuntimeError as exc:
+            error = str(exc)
+        # A lost response can still mean the server accepted the push.
+        verified = remote_head(repo, branch)
+        if verified == checkpoint:
+            progress(f"Verified origin/{branch} at {checkpoint[:8]}")
+            failures = 0
+            continue
+        if verified != previous:
+            raise RuntimeError("Remote changed during push. Fetch and review before retrying.")
+        failures += 1
+        if failures >= max_attempts:
+            raise RuntimeError(f"Push failed after {failures} attempts: {error}. "
+                               "Check access/network or remote hooks, then retry; commits are saved.")
+        step_limit = max(1, count // 2)
+        progress(f"Push retry {failures}/{max_attempts}: at most {step_limit} commit(s). {error}")
+
+
+def finish_pending_git(repo: Path, progress=lambda message: None, push: bool = True) -> bool:
     """Resume durable Git work without moving files or committing twice."""
     journal = pending_git_file(repo)
     if not journal.exists():
         return False
     state = json.loads(journal.read_text(encoding="utf-8"))
+    if _git(repo, "symbolic-ref", "--short", "HEAD").decode().strip() != state["branch"]:
+        raise RuntimeError(f"Switch back to {state['branch']} before resuming this transfer")
     result = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=repo, capture_output=True)
     head = result.stdout if result.returncode == 0 else b""
     # A successful commit changes HEAD even if the process stopped before push.
     if head.decode().strip() == state["head"]:
+        for path, expected in state.get("hashes", {}).items():
+            actual = file_digest(repo / path)
+            if actual != expected or (repo / path).stat().st_size > MAX_FILE_SIZE_BYTES:
+                raise RuntimeError(f"Pending file changed: {path}; restore it before retrying")
         payload = b"".join(p.encode("utf-8") + b"\0" for p in state["paths"])
         _git(
             repo,
@@ -98,6 +242,8 @@ def finish_pending_git(repo: Path) -> bool:
         )
         changed = _git(repo, "diff", "--cached", "--name-only", "-z")
         if not set(changed.split(b"\0")) & {p.encode("utf-8") for p in state["paths"]}:
+            if push:
+                push_unpublished(repo, state["branch"], progress)
             journal.unlink()
             return True
         if changed:
@@ -119,16 +265,31 @@ def finish_pending_git(repo: Path) -> bool:
             raise RuntimeError(
                 "HEAD changed outside the pending transfer; inspect before retrying."
             )
-    _git(repo, "push", "-u", "origin", state["branch"])
+    if push:
+        push_unpublished(repo, state["branch"], progress)
     journal.unlink()
     return True
 
 
-def stage_commit_push(repo: Path, paths: list[Path], message: str, branch: str) -> None:
+def stage_commit_push(repo: Path, paths: list[Path], message: str, branch: str,
+                      progress=lambda message: None, push: bool = True) -> None:
     pathspecs = repo_relative_paths(repo, paths)
     if not pathspecs:
         return
+    total = 0
+    for path in pathspecs:
+        size = (repo / path).stat().st_size
+        if size > MAX_FILE_SIZE_BYTES:
+            raise ValueError(f"{path}: exceeds GitHub's 100 MiB standard Git limit; no LFS enabled")
+        total += size
+    if total > MAX_BATCH_SIZE_BYTES:
+        raise ValueError("Commit exceeds 200 MiB; split the transfer into size-based batches")
     journal = pending_git_file(repo)
+    if journal.exists():
+        pending = json.loads(journal.read_text(encoding="utf-8"))
+        finish_pending_git(repo, progress, push)
+        if (pending["paths"], pending["message"], pending["branch"]) == (pathspecs, message, branch):
+            return
     if not journal.exists():
         head = subprocess.run(
             ["git", "rev-parse", "--verify", "HEAD"], cwd=repo, capture_output=True
@@ -138,8 +299,7 @@ def stage_commit_push(repo: Path, paths: list[Path], message: str, branch: str) 
             "message": message,
             "branch": branch,
             "head": head.stdout.decode().strip() if head.returncode == 0 else "",
+            "hashes": {path: file_digest(repo / path) for path in pathspecs},
         }
-        temporary = journal.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state, ensure_ascii=True), encoding="utf-8")
-        temporary.replace(journal)
-    finish_pending_git(repo)
+        write_journal(journal, state)
+    finish_pending_git(repo, progress, push)

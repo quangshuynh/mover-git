@@ -50,12 +50,27 @@ def test_make_batches_honors_limit_and_order() -> None:
     assert [[item.rel_path.name for item in batch] for batch in batches] == [["a", "b"], ["c"]]
 
 
-def test_make_batches_skips_individual_file_above_limit() -> None:
+def test_make_batches_rejects_individual_file_above_limit() -> None:
     """
     verify files larger than a batch are excluded
         :returns: nothing
     """
-    assert make_batches([entry("large", 11), entry("small", 2)], limit=10) == [[entry("small", 2)]]
+    with pytest.raises(ValueError, match="cannot be split"):
+        make_batches([entry("large", 11), entry("small", 2)], limit=10)
+
+
+def test_default_size_boundaries():
+    mib = 1024**2
+    files = [entry("a", 100*mib), entry("b", 100*mib), entry("c", 1)]
+    assert make_batches(files) == [files[:2], files[2:]]
+    for size in (100*mib + 1, 200*mib + 1):
+        with pytest.raises(ValueError, match="GitHub's 100 MiB"):
+            make_batches([entry("oversized", size)])
+
+
+def test_zero_byte_files_have_bounded_batches():
+    batches = make_batches([entry(str(i), 0) for i in range(2001)])
+    assert [len(batch) for batch in batches] == [1000, 1000, 1]
 
 
 @pytest.mark.parametrize(

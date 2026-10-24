@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
-MAX_BATCH_SIZE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_BATCH_SIZE_BYTES = 200 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -41,10 +41,17 @@ def make_batches(
     batches: list[list[FileEntry]] = []
     current: list[FileEntry] = []
     current_size = 0
+    if limit <= 0:
+        raise ValueError("Batch limit must be positive")
     for entry in files:
+        if entry.size > MAX_FILE_SIZE_BYTES:
+            raise ValueError(
+                f"{entry.rel_path}: exceeds GitHub's 100 MiB standard Git file limit; "
+                "file was not transferred. Git LFS is not enabled automatically."
+            )
         if entry.size > limit:
-            continue
-        if current and current_size + entry.size > limit:
+            raise ValueError(f"{entry.rel_path}: exceeds the batch ceiling; files cannot be split")
+        if current and (current_size + entry.size > limit or len(current) >= 1000):
             batches.append(current)
             current = []
             current_size = 0

@@ -1,5 +1,4 @@
 import os
-import shutil
 import subprocess
 import threading
 import tkinter as tk
@@ -19,7 +18,6 @@ from mover_git.core import (
 )
 from mover_git.git import (
     check_staging_support,
-    finish_pending_git,
     normalize_github_url,
     stage_commit_push,
 )
@@ -30,6 +28,7 @@ from mover_git.media import (
     is_supported_media,
     sanitize_timestamp_filename,
 )
+from mover_git.transfer import finish_transfer, prepare_transfer, resume_transfers
 
 register_heif_opener()
 
@@ -115,7 +114,7 @@ class FileMoverGitApp:
 
         ttk.Checkbutton(
             options_frame,
-            text="Commit/push after each 2 GB batch",
+            text="Push after each 200 MiB batch",
             variable=self.commit_each_batch_var,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=4)
 
@@ -420,7 +419,7 @@ class FileMoverGitApp:
                     continue
 
                 if size > MAX_FILE_SIZE_BYTES:
-                    self.skipped_files.append((rel_path, size, "Over 100 MB"))
+                    self.skipped_files.append((rel_path, size, "Exceeds GitHub 100 MiB standard Git limit (no automatic LFS)"))
                     self.total_skipped_size += size
                     continue
 
@@ -460,8 +459,8 @@ class FileMoverGitApp:
                     f"Batch: {self.current_batch}/{self.total_batches}\n"
                     f"Batch Files: {self.current_batch_files}/{self.current_batch_total}\n"
                     f"\n"
-                    f"Files Pushed: {self.total_files_pushed}/{len(self.valid_files)}\n"
-                    f"Data Pushed: {self.human_size(self.total_bytes_pushed)} / "
+                    f"Files Processed: {self.total_files_pushed}/{len(self.valid_files)}\n"
+                    f"Data Processed: {self.human_size(self.total_bytes_pushed)} / "
                     f"{self.human_size(self.total_valid_size)}"
                 )
             )
@@ -549,7 +548,7 @@ class FileMoverGitApp:
                 f"Git batches needed: {batch_count}\n"
                 f"Target inside repo: {self.dest_subfolder_var.get().strip() or '.'}\n"
                 f"Media organization: {organize_text}\n"
-                f"Limits: file <= 100 MB, batch <= 2 GB"
+                f"Limits: file <= 100 MiB, batch <= 200 MiB"
             )
         )
 
@@ -673,170 +672,63 @@ class FileMoverGitApp:
             return
         src, repo_root, dst = validated
 
+        branch = self.remote_branch_var.get().strip() or "main"
         try:
             check_staging_support(repo_root)
-            if finish_pending_git(repo_root):
+            if resume_transfers(repo_root, branch, self.log):
                 self.cleanup_empty_source_dirs(src)
                 self.scan_and_preview()
-        except Exception as exc:
-            self.log(f"ERROR: {exc}")
-            self.set_status("Git work pending; retry Move + Git Push after fixing the error")
-            self.show_error("Git recovery", str(exc))
-            return
-
-        if not self.valid_files:
-            self.log("No scan data found. Running scan first...")
-            self.scan_and_preview()
             if not self.valid_files:
-                self.log("Nothing to move.")
-                self.set_status("No files to move")
+                self.scan_and_preview()
+                if not self.valid_files:
+                    self.set_status("No files to move; unpublished commits checked")
+                    return
+            if not self.ask_yes_no(
+                "Confirm move",
+                "Copy, verify, commit and push files, then remove verified sources?",
+            ):
+                self.set_status("Move cancelled")
                 return
-
-        self.set_status("Checking Git repository status")
-        existing_status = self.run_command(
-            ["git", "status", "--porcelain"], repo_root, capture_output=True
-        )
-        if existing_status.strip():
-            self.log("Destination repository has pre-existing changes; move cancelled.")
-            self.show_error(
-                "Repository has changes",
-                "Commit, stash, or remove existing repository changes before moving files.",
-            )
-            self.set_status("Move cancelled because the repository has changes")
-            return
-
-        confirm = self.ask_yes_no(
-            "Confirm move",
-            "This will move valid files to the destination repo and run git add/commit/push. Continue?",
-        )
-        if not confirm:
-            self.set_status("Move cancelled")
-            return
-        
-        # init progress variables
-        self.total_files_pushed = 0
-        self.total_bytes_pushed = 0
-        self.current_batch = 0
-        self.total_batches = len(self.batches)
-        self.current_batch_files = 0
-        self.current_batch_total = 0
-        self.update_progress()
-        
-        #automatically switch to log tab
-        self.ui(self.notebook.select, 3)
-        self.ui(self.root.update_idletasks)
-
-        try:
+            self.total_files_pushed = 0
+            self.total_bytes_pushed = 0
+            self.current_batch = 0
+            self.total_batches = len(self.batches)
+            self.current_batch_files = 0
+            self.current_batch_total = 0
+            self.ui(self.notebook.select, 3)
+            self.ui(self.root.update_idletasks)
             if self.include_empty_dirs_var.get():
                 self.create_empty_directories(src, dst)
-
-            if self.commit_each_batch_var.get():
-                for batch_index, batch in enumerate(self.batches, start=1):
-                    self.set_status(f"Moving files in batch {batch_index} of {len(self.batches)}")
-                    used_move_paths = set()
-                    moved_paths: list[Path] = []
-                    # progress update for current batch
-                    self.current_batch = batch_index
-                    self.current_batch_files = 0
-                    self.current_batch_total = len(batch)
-                    self.update_progress()
-                    self.log(f"Starting batch {batch_index}/{len(self.batches)}...")
-                    moved_count = 0
-                    moved_bytes = 0
-
-                    for entry in batch:
-                        target_path = self.build_target_path(dst, entry, used_move_paths)
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
-
-                        if target_path.exists():
-                            raise FileExistsError(
-                                f"Destination already contains {target_path.relative_to(dst)}. "
-                                f"Remove or rename {target_path.relative_to(dst)} from source before moving."
-                            )
-
-                        shutil.move(str(entry.src_path), str(target_path))
-                        moved_paths.append(target_path)
-                        moved_count += 1
-                        moved_bytes += entry.size
-
-                        # progress update after each file move
-                        self.current_batch_files += 1
-                        self.total_files_pushed += 1
-                        self.total_bytes_pushed += entry.size
-                        self.update_progress()
-
-                        self.log(f"Moved: {entry.rel_path} -> {target_path.relative_to(dst)}")
-
-                    self.current_batch_files = self.current_batch_total
-                    self.update_progress()
-
-                    commit_message = self.make_commit_message(batch_index, len(self.batches), moved_count, moved_bytes)
-                    self.run_git_sequence(repo_root, commit_message, moved_paths)
-                    self.cleanup_empty_source_dirs(src)
-                    self.update_progress()
-                    self.log(f"Finished batch {batch_index}.")
-                    self.current_batch = batch_index
-                    self.current_batch_files = self.current_batch_total
-                    self.update_progress()
-            else:
-                self.log("Commit-each-batch disabled. Moving all files first, then committing once...")
-
-                moved_count = 0
-                moved_bytes = 0
-                moved_paths = []
-
-                for batch_index, batch in enumerate(self.batches, start=1):
-                    self.set_status(f"Moving files in batch {batch_index} of {len(self.batches)}")
-                    used_move_paths = set()
-                    self.current_batch = batch_index
-                    self.current_batch_files = 0
-                    self.current_batch_total = len(batch)
-                    self.update_progress()
-                    self.log(f"Moving batch {batch_index}/{len(self.batches)}...")
-                    for entry in batch:
-                        target_path = self.build_target_path(dst, entry, used_move_paths)
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
-
-                        if target_path.exists():
-                            raise FileExistsError(
-                                f"Destination already contains {target_path.relative_to(dst)}. "
-                                f"Remove or rename it before moving."
-                            )
-
-                        shutil.move(str(entry.src_path), str(target_path))
-                        moved_paths.append(target_path)
-                        moved_count += 1
-                        moved_bytes += entry.size
-
-                        # progress update after each file move
-                        self.current_batch_files += 1
-                        self.total_files_pushed += 1
-                        self.total_bytes_pushed += entry.size
-                        self.update_progress()
-
-                        self.log(f"Moved: {entry.rel_path} -> {target_path.relative_to(dst)}")
-
-                commit_message = self.make_commit_message(1, 1, moved_count, moved_bytes)
-                self.run_git_sequence(repo_root, commit_message, moved_paths)
-                self.cleanup_empty_source_dirs(src)
+            if not self.commit_each_batch_var.get():
+                self.log("Committing size-based batches; pushing together after copying completes.")
+            used_paths = set()
+            for batch_index, batch in enumerate(self.batches, 1):
+                self.current_batch = batch_index
+                self.current_batch_total = len(batch)
+                self.current_batch_files = 0
                 self.update_progress()
-                self.log("Finished single commit/push for all moved files.")
-            
-            self.current_batch = self.total_batches
-
-            if self.batches:
-                self.current_batch_total = len(self.batches[-1])
-                self.current_batch_files = self.current_batch_total
-
-            self.update_progress()
-            self.log("All batches completed successfully.")
-            self.set_status("Move, commit, and push completed")
+                size = sum(entry.size for entry in batch)
+                self.set_status(f"Batch {batch_index}/{len(self.batches)}: {human_size(size)}")
+                pairs = [(entry.src_path, self.build_target_path(dst, entry, used_paths))
+                         for entry in batch]
+                message = self.make_commit_message(batch_index, len(self.batches), len(batch), size)
+                journal = prepare_transfer(repo_root, pairs, message, branch)
+                finish_transfer(repo_root, journal, self.log,
+                                push=self.commit_each_batch_var.get())
+                self.current_batch_files = len(batch)
+                self.total_files_pushed += len(batch)
+                self.total_bytes_pushed += size
+                self.update_progress()
+                self.log(f"Batch {batch_index}/{len(self.batches)} committed: {human_size(size)}")
+            resume_transfers(repo_root, branch, self.log)
+            self.cleanup_empty_source_dirs(src)
+            self.set_status("Move, commit, and verified push completed")
             self.show_github_link(log_only=True)
             self.show_info("Done", "Move and git push completed.")
         except Exception as exc:
             self.log(f"ERROR: {exc}")
-            self.set_status(f"Error: {exc}")
-            self.show_error("Error", str(exc) + "\nRetry Move + Git Push to resume pending Git work.")
+            self.set_status("Transfer paused; fix the error and retry Move + Git Push")
+            self.show_error("Error", str(exc) + "\nRetry Move + Git Push to resume safely.")
 
 
     def create_empty_directories(self, src: Path, dst: Path) -> None:
