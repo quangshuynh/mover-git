@@ -68,9 +68,28 @@ def test_default_size_boundaries():
             make_batches([entry("oversized", size)])
 
 
-def test_zero_byte_files_have_bounded_batches():
+def test_zero_byte_files_default_to_unlimited():
     batches = make_batches([entry(str(i), 0) for i in range(2001)])
-    assert [len(batch) for batch in batches] == [1000, 1000, 1]
+    assert [len(batch) for batch in batches] == [2001]
+
+
+@pytest.mark.parametrize("maximum", [1, 1000, 10000])
+def test_optional_file_count_exact_boundaries(maximum):
+    files = [entry(str(i), 0) for i in range(maximum * 2 + 1)]
+    assert [len(batch) for batch in make_batches(files, max_files=maximum)] == [
+        maximum, maximum, 1]
+
+
+def test_both_limits_and_exact_byte_boundary():
+    files = [entry("a", 6), entry("b", 4), entry("zero", 0), entry("c", 1)]
+    assert make_batches(files, limit=10, max_files=3) == [files[:2], files[2:]]
+    assert make_batches(files, limit=10, max_files=1) == [[f] for f in files]
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_invalid_file_count(limit):
+    with pytest.raises(ValueError, match="positive integer"):
+        make_batches([], max_files=limit)
 
 
 @pytest.mark.parametrize(

@@ -44,7 +44,7 @@ Mover Git copies and hashes files first, then removes sources only after a verif
 
 The application validates paths, nesting, repository state, symbolic links, size limits, and destination collisions. Git staging uses explicit repository-relative pathspecs for files moved by Mover Git. It does not run `git add .`, reset unrelated work, or clean the repository.
 
-After interruption, retry Move + Git Push to resume journaled copies, commits, and unpublished history without duplicating commits. Conflicting or changed files require manual review.
+Use Pause After Current Batch to finish copying, committing, and verifying the current push before stopping. Resume continues the saved queue; reopening offers recovery after checking local and remote Git state. Conflicting files or changed Git history require manual review.
 
 ## Media Organization
 
@@ -80,7 +80,7 @@ Run the actual application entry point:
 python app.py
 ```
 
-Select the checked-out branch to publish to `origin`. Commits always stay within 200 MiB. The batch checkbox selects pushing after each batch or after all batches are committed. Sources remain until publication is verified.
+Select the checked-out branch to publish to `origin`. Every batch is committed and its push verified before sources are removed. Batches stop at 200 MiB or the optional maximum file count, whichever comes first. The file count defaults to unlimited (blank); Apply changes only unstarted batches, including during transfer. Previews show up to 500 entries while the full queue stays on disk.
 
 ## Development
 

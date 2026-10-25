@@ -1,5 +1,7 @@
 import shutil
 import subprocess
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,22 +13,6 @@ from mover_git.core import FileEntry
 
 def run(repo, *args):
     return subprocess.check_output(["git", *args], cwd=repo).rstrip(b"\r\n")
-
-
-@pytest.fixture
-def repo(tmp_path):
-    remote = tmp_path / "remote.git"
-    remote.mkdir()
-    run(remote, "init", "--bare")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    run(repo, "init", "-b", "main")
-    run(repo, "config", "user.name", "Test")
-    run(repo, "config", "user.email", "test@example.invalid")
-    run(repo, "config", "commit.gpgsign", "false")
-    run(repo, "config", "core.longpaths", "true")
-    run(repo, "remote", "add", "origin", str(remote))
-    return repo
 
 
 def test_thousands_of_literal_paths_and_long_names(repo, monkeypatch):
@@ -42,7 +28,9 @@ def test_thousands_of_literal_paths_and_long_names(repo, monkeypatch):
     calls = []
 
     def record(command, **kwargs):
-        calls.append((command, kwargs.get("input")))
+        for argument in command:
+            if argument.startswith("--pathspec-from-file="):
+                calls.append(Path(argument.split("=", 1)[1]).read_bytes())
         assert len(subprocess.list2cmdline(command)) < 2000
         return original(command, **kwargs)
 
@@ -51,9 +39,9 @@ def test_thousands_of_literal_paths_and_long_names(repo, monkeypatch):
     git.stage_commit_push(repo, paths, "batch", "main")
     tracked = set(run(repo, "ls-tree", "-rz", "--name-only", "HEAD").split(b"\0")) - {b""}
     assert tracked == {name.encode() for name in names}
-    for command, payload in calls:
-        if "--pathspec-from-file=-" in command:
-            assert set(payload.split(b"\0")) - {b""} == tracked
+    assert len(calls) == 2
+    for payload in calls:
+        assert set(payload.split(b"\0")) - {b""} == tracked
     assert run(repo, "rev-list", "--count", "HEAD") == b"1"
     assert not git.pending_git_file(repo).exists()
 
@@ -117,6 +105,12 @@ def test_transfer_failure_retains_source_dirs_and_retry_does_not_move_twice(
         path.write_text(name)
         files.append(FileEntry(path, path.relative_to(source), path.stat().st_size))
     app.valid_files = files
+    app.dest_var = SimpleNamespace(get=lambda: str(repo))
+    app.source_var = SimpleNamespace(get=lambda: str(source))
+    app.commit_prefix_var = SimpleNamespace(get=lambda: "batch")
+    app.session_file = repo.parent / "config" / "session.json"
+    app.max_files = 1
+    app.pause_event = threading.Event()
     app.batches = [[f] for f in files]
     app.validate_paths = lambda: (source, repo, repo)
     app.include_empty_dirs_var = SimpleNamespace(get=lambda: False)
