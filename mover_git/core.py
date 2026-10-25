@@ -30,7 +30,7 @@ def human_size(size_bytes: int) -> str:
 
 
 def make_batches(
-    files: list[FileEntry], limit: int = MAX_BATCH_SIZE_BYTES
+    files: list[FileEntry], limit: int = MAX_BATCH_SIZE_BYTES, max_files: int | None = None
 ) -> list[list[FileEntry]]:
     """
     divide files into ordered batches within a size limit
@@ -41,8 +41,10 @@ def make_batches(
     batches: list[list[FileEntry]] = []
     current: list[FileEntry] = []
     current_size = 0
-    if limit <= 0:
-        raise ValueError("Batch limit must be positive")
+    if not 0 < limit <= MAX_BATCH_SIZE_BYTES:
+        raise ValueError("Batch limit must be positive and at most 200 MiB")
+    if max_files is not None and (type(max_files) is not int or max_files <= 0):
+        raise ValueError("File count limit must be a positive integer or unlimited")
     for entry in files:
         if entry.size > MAX_FILE_SIZE_BYTES:
             raise ValueError(
@@ -51,7 +53,9 @@ def make_batches(
             )
         if entry.size > limit:
             raise ValueError(f"{entry.rel_path}: exceeds the batch ceiling; files cannot be split")
-        if current and (current_size + entry.size > limit or len(current) >= 1000):
+        if current and (current_size + entry.size > limit
+                        or current_size == limit
+                        or (max_files is not None and len(current) >= max_files)):
             batches.append(current)
             current = []
             current_size = 0
@@ -60,6 +64,20 @@ def make_batches(
     if current:
         batches.append(current)
     return batches
+
+
+def batch_sizes(files, max_files=None):
+    """Preview batch boundaries without retaining entries or all batch summaries."""
+    count = size = 0
+    for entry in files:
+        if count and (size + entry.size > MAX_BATCH_SIZE_BYTES or size == MAX_BATCH_SIZE_BYTES
+                      or (max_files is not None and count >= max_files)):
+            yield count, size
+            count = size = 0
+        count += 1
+        size += entry.size
+    if count:
+        yield count, size
 
 
 def validate_paths(source: Path, repo: Path, subfolder: str = "") -> tuple[Path, Path, Path]:

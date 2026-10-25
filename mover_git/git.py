@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from mover_git.core import MAX_BATCH_SIZE_BYTES, MAX_FILE_SIZE_BYTES, human_size
+from mover_git.storage import DiskSet, records, remove_journal
 
 PUSH_BUDGET_BYTES = 1024**3
 GIT_CONFIG = ["-c", "maintenance.auto=false", "-c", "gc.auto=0",
@@ -227,36 +228,43 @@ def finish_pending_git(repo: Path, progress=lambda message: None, push: bool = T
     head = result.stdout if result.returncode == 0 else b""
     # A successful commit changes HEAD even if the process stopped before push.
     if head.decode().strip() == state["head"]:
-        for path, expected in state.get("hashes", {}).items():
-            actual = file_digest(repo / path)
-            if actual != expected or (repo / path).stat().st_size > MAX_FILE_SIZE_BYTES:
-                raise RuntimeError(f"Pending file changed: {path}; restore it before retrying")
-        payload = b"".join(p.encode("utf-8") + b"\0" for p in state["paths"])
-        _git(
-            repo,
-            "--literal-pathspecs",
-            "add",
-            "--pathspec-from-file=-",
-            "--pathspec-file-nul",
-            data=payload,
-        )
-        changed = _git(repo, "diff", "--cached", "--name-only", "-z")
-        if not set(changed.split(b"\0")) & {p.encode("utf-8") for p in state["paths"]}:
-            if push:
-                push_unpublished(repo, state["branch"], progress)
-            journal.unlink()
-            return True
-        if changed:
-            _git(
-                repo,
-                "--literal-pathspecs",
-                "commit",
-                "-m",
-                state["message"],
-                "--pathspec-from-file=-",
-                "--pathspec-file-nul",
-                data=payload,
-            )
+        def selected_records():
+            if "paths" in state:
+                for path in state["paths"]:
+                    yield {"path": path, "hash": state.get("hashes", {}).get(path)}
+            else:
+                yield from records(state, journal)
+
+        with DiskSet() as selected, tempfile.TemporaryDirectory(prefix="mover-git-") as folder:
+            pathspec = Path(folder) / "paths"
+            with pathspec.open("wb") as stream:
+                for record in selected_records():
+                    path, expected = record["path"], record["hash"]
+                    actual = file_digest(repo / path)
+                    if expected and (actual != expected or
+                                     (repo / path).stat().st_size > MAX_FILE_SIZE_BYTES):
+                        raise RuntimeError(f"Pending file changed: {path}; restore it before retrying")
+                    selected.add(path)
+                    stream.write(path.encode("utf-8") + b"\0")
+            path_args = (f"--pathspec-from-file={pathspec}", "--pathspec-file-nul")
+            _git(repo, "--literal-pathspecs", "add", *path_args)
+            changed = False
+            with tempfile.TemporaryFile() as names:
+                result = subprocess.run(["git", *GIT_CONFIG, "diff", "--cached", "--name-only", "-z"],
+                                        cwd=repo, stdout=names, stderr=subprocess.PIPE)
+                if result.returncode:
+                    raise RuntimeError(result.stderr.decode(errors="replace"))
+                names.seek(0)
+                pending = b""
+                while chunk := names.read(65536):
+                    parts = (pending + chunk).split(b"\0")
+                    pending = parts.pop()
+                    if any(path.decode("utf-8") in selected for path in parts):
+                        changed = True
+                        break
+            if changed:
+                _git(repo, "--literal-pathspecs", "commit", "--quiet", "-m", state["message"], *path_args)
+
     else:
         # Refuse to treat an unrelated commit as completion of our batch.
         message = _git(repo, "log", "-1", "--format=%B").decode("utf-8").strip()
@@ -267,39 +275,43 @@ def finish_pending_git(repo: Path, progress=lambda message: None, push: bool = T
             )
     if push:
         push_unpublished(repo, state["branch"], progress)
-    journal.unlink()
+    remove_journal(journal)
     return True
 
 
 def stage_commit_push(repo: Path, paths: list[Path], message: str, branch: str,
                       progress=lambda message: None, push: bool = True) -> None:
-    pathspecs = repo_relative_paths(repo, paths)
-    if not pathspecs:
-        return
-    total = 0
-    for path in pathspecs:
-        size = (repo / path).stat().st_size
-        if size > MAX_FILE_SIZE_BYTES:
-            raise ValueError(f"{path}: exceeds GitHub's 100 MiB standard Git limit; no LFS enabled")
-        total += size
-    if total > MAX_BATCH_SIZE_BYTES:
-        raise ValueError("Commit exceeds 200 MiB; split the transfer into size-based batches")
     journal = pending_git_file(repo)
     if journal.exists():
         pending = json.loads(journal.read_text(encoding="utf-8"))
         finish_pending_git(repo, progress, push)
-        if (pending["paths"], pending["message"], pending["branch"]) == (pathspecs, message, branch):
+        if (pending["message"], pending["branch"]) == (message, branch):
             return
-    if not journal.exists():
-        head = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD"], cwd=repo, capture_output=True
-        )
-        state = {
-            "paths": pathspecs,
-            "message": message,
-            "branch": branch,
-            "head": head.stdout.decode().strip() if head.returncode == 0 else "",
-            "hashes": {path: file_digest(repo / path) for path in pathspecs},
-        }
-        write_journal(journal, state)
+    total = count = 0
+    manifest = journal.with_suffix(".jsonl")
+    temporary = manifest.with_suffix(".building")
+    with DiskSet() as selected, temporary.open("w", encoding="utf-8") as stream:
+        for candidate in paths:
+            path = candidate.resolve().relative_to(repo.resolve()).as_posix()
+            if path in selected:
+                continue
+            selected.add(path)
+            size = (repo / path).stat().st_size
+            if size > MAX_FILE_SIZE_BYTES:
+                raise ValueError(f"{path}: exceeds GitHub's 100 MiB standard Git limit; no LFS enabled")
+            total += size
+            if total > MAX_BATCH_SIZE_BYTES:
+                raise ValueError("Commit exceeds 200 MiB; split the transfer into size-based batches")
+            stream.write(json.dumps({"path": path, "hash": file_digest(repo / path)}) + "\n")
+            count += 1
+        stream.flush()
+        os.fsync(stream.fileno())
+    if not count:
+        temporary.unlink()
+        return
+    temporary.replace(manifest)
+    head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=repo, capture_output=True)
+    state = {"message": message, "branch": branch,
+             "head": head.stdout.decode().strip() if head.returncode == 0 else "", "count": count}
+    write_journal(journal, state)
     finish_pending_git(repo, progress, push)

@@ -1,4 +1,6 @@
+import json
 import os
+import sqlite3
 import subprocess
 import threading
 import tkinter as tk
@@ -11,6 +13,7 @@ from pillow_heif import register_heif_opener
 from mover_git.core import (
     MAX_FILE_SIZE_BYTES,
     FileEntry,
+    batch_sizes,
     human_size,
     make_batches,
     make_commit_message,
@@ -19,7 +22,9 @@ from mover_git.core import (
 from mover_git.git import (
     check_staging_support,
     normalize_github_url,
+    pending_git_file,
     stage_commit_push,
+    write_journal,
 )
 from mover_git.media import (
     MEDIA_FILE_TYPES,
@@ -28,7 +33,8 @@ from mover_git.media import (
     is_supported_media,
     sanitize_timestamp_filename,
 )
-from mover_git.transfer import finish_transfer, prepare_transfer, resume_transfers
+from mover_git.storage import DiskSet, FileInventory, walk_entries
+from mover_git.transfer import BatchOperation, operation_file, resume_transfers, transfer_directory
 
 register_heif_opener()
 
@@ -74,8 +80,19 @@ class FileMoverGitApp:
         self.current_batch_files = 0
         self.current_batch_total = 0
         self.is_busy = False
+        self.last_status = "Ready"
+        self.progress_total_files = 0
+        self.operation = None
+        self.max_files = None
+        self.pause_event = threading.Event()
+        self.close_after_pause = False
+        self.pending_operation = False
+        self.max_files_var = tk.StringVar()
+        self.session_file = Path.home() / ".git-mover" / "session.json"
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.request_close)
+        self.root.after(0, self.restore_session)
 
 
     def _build_ui(self) -> None:
@@ -112,11 +129,14 @@ class FileMoverGitApp:
         ttk.Label(options_frame, text="Branch:").grid(row=0, column=2, sticky="w", pady=4)
         ttk.Entry(options_frame, textvariable=self.remote_branch_var, width=12).grid(row=0, column=3, sticky="w", padx=8)
 
-        ttk.Checkbutton(
-            options_frame,
-            text="Push after each 200 MiB batch",
-            variable=self.commit_each_batch_var,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Label(options_frame, text="Push and verify every batch (maximum 200 MiB)").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Label(options_frame, text="Maximum files (blank = unlimited):").grid(
+            row=2, column=0, sticky="w", pady=4)
+        self.max_files_entry = ttk.Entry(options_frame, textvariable=self.max_files_var, width=16)
+        self.max_files_entry.grid(row=2, column=1, sticky="w", padx=8)
+        self.limit_button = ttk.Button(options_frame, text="Apply", command=self.apply_limit)
+        self.limit_button.grid(row=2, column=2, sticky="w")
 
         ttk.Checkbutton(
             options_frame,
@@ -164,6 +184,12 @@ class FileMoverGitApp:
         self.scan_button.pack(side="left", padx=(0, 8))
         self.move_button = ttk.Button(buttons_frame, text="2) Move + Git Push", command=self.move_in_thread)
         self.move_button.pack(side="left", padx=8)
+        self.pause_button = ttk.Button(buttons_frame, text="Pause After Current Batch",
+                                       command=self.request_pause, state="disabled")
+        self.pause_button.pack(side="left", padx=8)
+        self.resume_button = ttk.Button(buttons_frame, text="Resume",
+                                        command=self.resume_in_thread, state="disabled")
+        self.resume_button.pack(side="left", padx=8)
         ttk.Button(buttons_frame, text="Clear Log", command=self.clear_log).pack(side="left", padx=8)
         ttk.Button(buttons_frame, text="Show GitHub Link", command=self.show_github_link).pack(side="left", padx=8)
 
@@ -211,6 +237,102 @@ class FileMoverGitApp:
         self.skipped_text = self._make_text_tab(self.notebook, "Skipped files")
         self.batch_text = self._make_text_tab(self.notebook, "Batches")
         self.log_text = self._make_text_tab(self.notebook, "Log")
+        self.unsafe_widgets = []
+
+        def collect(parent):
+            for child in parent.winfo_children():
+                if isinstance(child, ttk.Entry | ttk.Checkbutton | ttk.Button):
+                    self.unsafe_widgets.append(child)
+                collect(child)
+
+        for frame in (source_frame, options_frame, media_frame):
+            collect(frame)
+        self.unsafe_widgets.remove(self.max_files_entry)
+        self.unsafe_widgets.remove(self.limit_button)
+
+    def apply_limit(self):
+        try:
+            raw = self.max_files_var.get().strip().replace(",", "")
+            value = int(raw) if raw else None
+            BatchOperation.validate_limit(value)
+            self.max_files = value
+            operation = self.operation
+            if operation:
+                operation.set_limit(value)
+            elif self.pending_operation and operation_file(Path(self.dest_var.get())).exists():
+                operation = BatchOperation(Path(self.dest_var.get()))
+                try:
+                    operation.set_limit(value)
+                finally:
+                    operation.close()
+            elif self.valid_files and not self.is_busy:
+                self.total_batches = sum(1 for _ in batch_sizes(self.valid_files, value))
+                self.update_progress()
+            self.log(f"Maximum files: {value or 'unlimited'}; applies to unstarted batches.")
+            return True
+        except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
+            self.show_error("Invalid file limit", str(exc))
+            return False
+
+    def request_pause(self):
+        self.pause_event.set()
+        self.set_status("Pause Requested")
+        self.pause_button.configure(state="disabled")
+
+    def request_close(self):
+        if not self.is_busy:
+            self.root.destroy()
+        elif messagebox.askyesno("Operation running", "Pause safely and close when the current "
+                                "batch is verified? Choose No to continue working."):
+            self.close_after_pause = True
+            self.request_pause()
+
+    def restore_session(self):
+        try:
+            if not self.session_file.exists():
+                return
+            saved = json.loads(self.session_file.read_text(encoding="utf-8"))
+            self.source_var.set(saved["source"])
+            self.dest_var.set(saved["repo"])
+            self.detect_pending()
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            self.set_status("Error")
+            self.show_error("Recovery unavailable", str(exc))
+
+    def detect_pending(self):
+        repo = Path(self.dest_var.get())
+        if operation_file(repo).exists():
+            operation = BatchOperation(repo)
+            try:
+                self.pending_operation = operation.state["status"] != "Complete"
+                self.remote_branch_var.set(operation.state["branch"])
+                self.max_files = operation.max_files
+                self.max_files_var.set(str(self.max_files or ""))
+            finally:
+                operation.close()
+            if self.pending_operation:
+                self.set_busy(False, "Paused")
+                if messagebox.askyesno("Pending transfer", "A saved transfer is pending. Resume "
+                                      "after checking local and remote Git state?"):
+                    self.resume_in_thread()
+        elif pending_git_file(repo).exists() or any(transfer_directory(repo).glob("*.json")):
+            journal = pending_git_file(repo)
+            if not journal.exists():
+                journal = next(transfer_directory(repo).glob("*.json"))
+            saved = json.loads(journal.read_text(encoding="utf-8"))
+            self.remote_branch_var.set(saved["branch"])
+            self.pending_operation = True
+            self.set_busy(False, "Paused")
+            if messagebox.askyesno("Pending transfer", "An earlier transfer needs recovery. "
+                                  "Verify and resume its Git work?"):
+                self.resume_in_thread()
+
+    def resume_in_thread(self):
+        if self.is_busy or not self.apply_limit():
+            return
+        self.pause_event.clear()
+        self.set_busy(True, "Resuming")
+        threading.Thread(target=self._move_worker, daemon=False).start()
 
 
     def _make_text_tab(self, notebook: ttk.Notebook, title: str) -> tk.Text:
@@ -245,6 +367,8 @@ class FileMoverGitApp:
             """
             self.log_text.insert("end", message + "\n")
             self.log_text.see("end")
+            if int(self.log_text.index("end-1c").split(".")[0]) > 2000:
+                self.log_text.delete("1.0", "501.0")
         self.root.after(0, _log)
 
 
@@ -274,6 +398,10 @@ class FileMoverGitApp:
         folder = filedialog.askdirectory(title="Select destination repo folder")
         if folder:
             self.dest_var.set(folder)
+            try:
+                self.detect_pending()
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                self.show_error("Recovery unavailable", str(exc))
 
 
     def pick_dest_subfolder(self) -> None:
@@ -300,10 +428,10 @@ class FileMoverGitApp:
         start the scan process in a background thread
         :returns: nothing
         """
-        if self.is_busy:
+        if self.is_busy or self.pending_operation:
             return
         self.set_busy(True, "Scanning")
-        threading.Thread(target=self._scan_worker, daemon=True).start()
+        threading.Thread(target=self._scan_worker, daemon=False).start()
 
 
     def move_in_thread(self) -> None:
@@ -311,10 +439,11 @@ class FileMoverGitApp:
         start the move and push process in a background thread
         :returns: nothing
         """
-        if self.is_busy:
+        if self.is_busy or self.pending_operation or not self.apply_limit():
             return
-        self.set_busy(True, "Moving files")
-        threading.Thread(target=self._move_worker, daemon=True).start()
+        self.pause_event.clear()
+        self.set_busy(True, "Running")
+        threading.Thread(target=self._move_worker, daemon=False).start()
 
     def _scan_worker(self) -> None:
         """
@@ -323,8 +452,14 @@ class FileMoverGitApp:
         """
         try:
             self.scan_and_preview()
+            self.set_status("Scan complete")
+        except Exception as exc:
+            self.set_status("Error")
+            self.show_error("Scan failed", str(exc))
         finally:
-            self.set_busy(False, "Scan complete")
+            self.set_busy(False)
+            if self.close_after_pause:
+                self.ui(self.root.destroy)
 
     def _move_worker(self) -> None:
         """
@@ -335,6 +470,9 @@ class FileMoverGitApp:
             self.move_and_push()
         finally:
             self.set_busy(False)
+            if self.close_after_pause and self.last_status in ("Paused", "Complete"):
+                self.ui(self.root.destroy)
+            self.close_after_pause = False
 
     def set_busy(self, busy: bool, status: str | None = None) -> None:
         """
@@ -344,9 +482,16 @@ class FileMoverGitApp:
         :returns: nothing
         """
         self.is_busy = busy
-        state = "disabled" if busy else "normal"
+        state = "disabled" if busy or self.pending_operation else "normal"
         self.ui(self.scan_button.configure, state=state)
         self.ui(self.move_button.configure, state=state)
+        for widget in self.unsafe_widgets:
+            self.ui(widget.configure, state=state)
+        self.ui(self.pause_button.configure, state="normal" if busy else "disabled")
+        self.ui(self.resume_button.configure,
+                state="normal" if self.pending_operation and not busy else "disabled")
+        for widget in (self.max_files_entry, self.limit_button):
+            self.ui(widget.configure, state="disabled" if busy and status == "Scanning" else "normal")
         if status is not None:
             self.set_status(status)
 
@@ -356,6 +501,7 @@ class FileMoverGitApp:
         :param status: status text to display
         :returns: nothing
         """
+        self.last_status = status
         self.ui(self.status_label.configure, text=f"Status: {status}")
         self.ui(self.root.title, f"File Mover + Git Push | {status}")
 
@@ -386,7 +532,10 @@ class FileMoverGitApp:
             return
         src, _, dst = validated
 
-        self.valid_files = []
+        if isinstance(self.valid_files, FileInventory):
+            self.valid_files.close()
+        self.valid_files = FileInventory()
+        self.skipped_count = 0
         self.skipped_files = []
         self.batches = []
         self.total_valid_size = 0
@@ -398,38 +547,36 @@ class FileMoverGitApp:
 
         self.log("Scanning source folder...")
 
-        all_dirs = set()
-        for root_dir, _dirnames, filenames in os.walk(src):
-            root_path = Path(root_dir)
-            rel_dir = root_path.relative_to(src)
-            all_dirs.add(rel_dir)
+        all_dirs = 0
+        for full_path, is_directory in walk_entries(src):
+            if is_directory:
+                all_dirs += 1
+                continue
+            rel_path = full_path.relative_to(src)
 
-            for filename in filenames:
-                full_path = root_path / filename
-                rel_path = full_path.relative_to(src)
+            if full_path.is_symlink():
+                self.record_skipped((rel_path, 0, "Skipped symlink"))
+                continue
 
-                if full_path.is_symlink():
-                    self.skipped_files.append((rel_path, 0, "Skipped symlink"))
-                    continue
+            try:
+                size = full_path.stat().st_size
+            except OSError as exc:
+                self.record_skipped((rel_path, 0, f"Unreadable: {exc}"))
+                continue
 
-                try:
-                    size = full_path.stat().st_size
-                except OSError as exc:
-                    self.skipped_files.append((rel_path, 0, f"Unreadable: {exc}"))
-                    continue
+            if size > MAX_FILE_SIZE_BYTES:
+                self.record_skipped((rel_path, size, "Exceeds GitHub 100 MiB standard Git limit (no automatic LFS)"))
+                self.total_skipped_size += size
+                continue
 
-                if size > MAX_FILE_SIZE_BYTES:
-                    self.skipped_files.append((rel_path, size, "Exceeds GitHub 100 MiB standard Git limit (no automatic LFS)"))
-                    self.total_skipped_size += size
-                    continue
-
-                entry = FileEntry(src_path=full_path, rel_path=rel_path, size=size)
-                self.valid_files.append(entry)
-                self.total_valid_size += size
+            entry = FileEntry(src_path=full_path, rel_path=rel_path, size=size)
+            self.valid_files.append(entry)
+            self.total_valid_size += size
 
         self.valid_files.sort(key=lambda e: str(e.rel_path).lower())
+        self.progress_total_files = len(self.valid_files)
         self.skipped_files.sort(key=lambda x: str(x[0]).lower())
-        self.batches = make_batches(self.valid_files)
+        self.total_batches = sum(1 for _ in batch_sizes(self.valid_files, self.max_files))
 
         self.write_preview(all_dirs, dst)
         self.log("Scan complete.")
@@ -438,7 +585,6 @@ class FileMoverGitApp:
         self.total_files_pushed = 0
         self.total_bytes_pushed = 0
         self.current_batch = 0
-        self.total_batches = len(self.batches)
         self.current_batch_files = 0
         self.current_batch_total = 0
         self.update_progress()
@@ -456,15 +602,15 @@ class FileMoverGitApp:
             """
             self.progress_label.config(
                 text=(
-                    f"Batch: {self.current_batch}/{self.total_batches}\n"
+                    f"Batch: {self.current_batch}\n"
                     f"Batch Files: {self.current_batch_files}/{self.current_batch_total}\n"
                     f"\n"
-                    f"Files Processed: {self.total_files_pushed}/{len(self.valid_files)}\n"
+                    f"Files Processed: {self.total_files_pushed}/{self.progress_total_files}\n"
                     f"Data Processed: {self.human_size(self.total_bytes_pushed)} / "
                     f"{self.human_size(self.total_valid_size)}"
                 )
             )
-            total = len(self.valid_files)
+            total = self.progress_total_files
             self.progress_bar.configure(value=(self.total_files_pushed / total * 100) if total else 0)
 
         self.root.after(0, _update)
@@ -479,78 +625,39 @@ class FileMoverGitApp:
         return make_batches(files)
 
 
-    def write_preview(self, all_dirs: set[Path], dst: Path) -> None:
-        """
-        display preview information for valid files skipped files batches and summary
-        :param all_dirs: set of discovered directories from the source folder
-        :param dst: destination folder for preview paths
-        :returns: nothing
-        """
-        used_preview_paths: set[Path] = set()
-        preview_paths = {
-            entry.src_path: self.build_target_path_preview(dst, entry, used_preview_paths)
-            for entry in self.valid_files
-        }
+    def record_skipped(self, item):
+        self.skipped_count += 1
+        if len(self.skipped_files) < 500:
+            self.skipped_files.append(item)
+
+    def write_preview(self, all_dirs: int, dst: Path) -> None:
+        # Keep Tk's text buffers and preview planning bounded as well as the queue.
         valid_lines = []
-        for entry in self.valid_files:
-            target_preview = preview_paths[entry.src_path]
-            valid_lines.append(
-                f"{entry.rel_path}  ->  {target_preview.relative_to(dst) if target_preview.is_relative_to(dst) else target_preview}  |  {self.human_size(entry.size)}"
-            )
-
-        self.ui(
-            self.valid_text.insert,
-            "1.0",
-            "\n".join(valid_lines) if valid_lines else "No valid files found."
-        )
-        skipped_lines = []
-        for rel_path, size, reason in self.skipped_files:
-            size_text = self.human_size(size) if size else "0 B"
-            skipped_lines.append(f"{rel_path}  |  {size_text}  |  {reason}")
-
-        self.ui(
-            self.skipped_text.insert,
-            "1.0",
-            "\n".join(skipped_lines) if skipped_lines else "No skipped files."
-        )
-
-        batch_lines = []
-        for i, batch in enumerate(self.batches, start=1):
-            batch_size = sum(x.size for x in batch)
-            batch_lines.append(f"Batch {i}: {len(batch)} files, {self.human_size(batch_size)}")
-            for entry in batch:
-                target_preview = preview_paths[entry.src_path]
-                shown_target = target_preview.relative_to(dst) if target_preview.is_relative_to(dst) else target_preview
-                batch_lines.append(
-                    f"    {entry.rel_path}  ->  {shown_target}  |  {self.human_size(entry.size)}"
-                )
-            batch_lines.append("")
-
-        self.ui(
-            self.batch_text.insert,
-            "1.0",
-            "\n".join(batch_lines) if batch_lines else "No batches created."
-        )
-
-        dir_count = len([d for d in all_dirs if str(d) != "."])
-        skipped_count = len(self.skipped_files)
-        valid_count = len(self.valid_files)
-        batch_count = len(self.batches)
-
-        organize_text = "On" if self.organize_media_var.get() else "Off"
-
-        self.ui(
-            self.summary_label.config,
-            text=(
-                f"Valid files: {valid_count} ({self.human_size(self.total_valid_size)})\n"
-                f"Skipped files: {skipped_count} ({self.human_size(self.total_skipped_size)})\n"
-                f"Folders discovered: {dir_count}\n"
-                f"Git batches needed: {batch_count}\n"
-                f"Target inside repo: {self.dest_subfolder_var.get().strip() or '.'}\n"
-                f"Media organization: {organize_text}\n"
-                f"Limits: file <= 100 MiB, batch <= 200 MiB"
-            )
-        )
+        with DiskSet() as used:
+            for index, entry in enumerate(self.valid_files):
+                if index >= 500:
+                    valid_lines.append("Preview limited to 500 files; all files remain queued.")
+                    break
+                target = self.build_target_path_preview(dst, entry, used)
+                valid_lines.append(f"{entry.rel_path} -> {target} | {human_size(entry.size)}")
+        self.ui(self.valid_text.insert, "1.0", "\n".join(valid_lines) or "No valid files.")
+        self.ui(self.skipped_text.insert, "1.0", "\n".join(
+            f"{path} | {human_size(size)} | {reason}" for path, size, reason in self.skipped_files
+        ) or "No skipped files.")
+        lines = []
+        for index, (count, size) in enumerate(batch_sizes(self.valid_files, self.max_files), 1):
+            if index > 500:
+                lines.append("Preview limited to 500 batches.")
+                break
+            lines.append(f"Batch {index}: {count} files, {human_size(size)}")
+        self.ui(self.batch_text.insert, "1.0", "\n".join(lines) or "No batches.")
+        self.ui(self.summary_label.config, text=(
+            f"Valid files: {len(self.valid_files)} ({human_size(self.total_valid_size)})\n"
+            f"Skipped files: {self.skipped_count} ({human_size(self.total_skipped_size)})\n"
+            f"Folders discovered: {all_dirs}\nGit batches needed: {self.total_batches}\n"
+            f"Limits: file <= 100 MiB, batch <= 200 MiB; "
+            f"maximum files: {self.max_files or 'unlimited'}"
+        ))
 
 
     @staticmethod
@@ -665,70 +772,84 @@ class FileMoverGitApp:
         move files to the destination repository and perform Git operations
         :returns: nothing
         """
-        self.set_status("Validating folders and repository")
-        validated = self.validate_paths()
-        if not validated:
-            self.set_status("Validation failed")
-            return
-        src, repo_root, dst = validated
-
-        branch = self.remote_branch_var.get().strip() or "main"
+        operation = None
         try:
-            check_staging_support(repo_root)
-            if resume_transfers(repo_root, branch, self.log):
-                self.cleanup_empty_source_dirs(src)
-                self.scan_and_preview()
-            if not self.valid_files:
+            repo_root = Path(self.dest_var.get()).resolve()
+            saved = operation_file(repo_root)
+            if saved.exists():
+                operation = BatchOperation(repo_root)
+                if operation.state["status"] == "Complete":
+                    operation.close()
+                    operation = None
+                    saved.unlink()
+            if operation is None:
+                if getattr(self, "pending_operation", False):
+                    resume_transfers(repo_root, self.remote_branch_var.get(), self.log)
+                    self.pending_operation = False
+                    self.set_status("Complete")
+                    return
+                validated = self.validate_paths()
+                if not validated:
+                    self.set_status("Error")
+                    return
+                src, repo_root, dst = validated
+                branch = self.remote_branch_var.get().strip() or "main"
+                check_staging_support(repo_root)
+                resume_transfers(repo_root, branch, self.log)
+                # Re-scan so changed paths/options cannot reuse an obsolete preview.
                 self.scan_and_preview()
                 if not self.valid_files:
-                    self.set_status("No files to move; unpublished commits checked")
+                    self.set_status("Complete")
                     return
-            if not self.ask_yes_no(
-                "Confirm move",
-                "Copy, verify, commit and push files, then remove verified sources?",
-            ):
-                self.set_status("Move cancelled")
-                return
-            self.total_files_pushed = 0
-            self.total_bytes_pushed = 0
-            self.current_batch = 0
-            self.total_batches = len(self.batches)
-            self.current_batch_files = 0
-            self.current_batch_total = 0
-            self.ui(self.notebook.select, 3)
-            self.ui(self.root.update_idletasks)
-            if self.include_empty_dirs_var.get():
-                self.create_empty_directories(src, dst)
-            if not self.commit_each_batch_var.get():
-                self.log("Committing size-based batches; pushing together after copying completes.")
-            used_paths = set()
-            for batch_index, batch in enumerate(self.batches, 1):
-                self.current_batch = batch_index
-                self.current_batch_total = len(batch)
+                if not self.ask_yes_no("Confirm move", "Copy, verify, commit and push files, "
+                                       "then remove verified sources?"):
+                    self.set_status("Paused")
+                    return
+                if self.include_empty_dirs_var.get():
+                    self.create_empty_directories(src, dst)
+                self.session_file.parent.mkdir(parents=True, exist_ok=True)
+                write_journal(self.session_file, {"source": str(src), "repo": str(repo_root)})
+                with DiskSet() as used_paths:
+                    pairs = ((entry.src_path, self.build_target_path(dst, entry, used_paths))
+                             for entry in self.valid_files)
+                    operation = BatchOperation.create(repo_root, pairs, branch,
+                                                       self.commit_prefix_var.get() or "update",
+                                                       self.max_files)
+            self.pending_operation = True
+            self.operation = operation
+            operation.pause = self.pause_event
+            operation.set_limit(self.max_files)
+            self.progress_total_files, self.total_valid_size = operation.db.execute(
+                "SELECT count(*),coalesce(sum(size),0) FROM queue").fetchone()
+
+            def status(value):
+                self.total_files_pushed = operation.state["completed"]
+                self.total_bytes_pushed = operation.state["bytes"]
+                active = operation.state["active"]
+                self.current_batch = operation.state["batch"] + bool(active)
+                self.current_batch_total = active["count"] if active else 0
                 self.current_batch_files = 0
                 self.update_progress()
-                size = sum(entry.size for entry in batch)
-                self.set_status(f"Batch {batch_index}/{len(self.batches)}: {human_size(size)}")
-                pairs = [(entry.src_path, self.build_target_path(dst, entry, used_paths))
-                         for entry in batch]
-                message = self.make_commit_message(batch_index, len(self.batches), len(batch), size)
-                journal = prepare_transfer(repo_root, pairs, message, branch)
-                finish_transfer(repo_root, journal, self.log,
-                                push=self.commit_each_batch_var.get())
-                self.current_batch_files = len(batch)
-                self.total_files_pushed += len(batch)
-                self.total_bytes_pushed += size
-                self.update_progress()
-                self.log(f"Batch {batch_index}/{len(self.batches)} committed: {human_size(size)}")
-            resume_transfers(repo_root, branch, self.log)
-            self.cleanup_empty_source_dirs(src)
-            self.set_status("Move, commit, and verified push completed")
-            self.show_github_link(log_only=True)
-            self.show_info("Done", "Move and git push completed.")
+                self.set_status(value)
+
+            def progress(message):
+                if self.pause_event.is_set():
+                    self.set_status("Finishing Batch")
+                self.log(message)
+
+            operation.run(progress, status)
+            if operation.state["status"] == "Complete":
+                self.pending_operation = False
+                self.cleanup_empty_source_dirs(Path(self.source_var.get()))
+                self.show_info("Done", "Move and verified git push completed.")
         except Exception as exc:
             self.log(f"ERROR: {exc}")
-            self.set_status("Transfer paused; fix the error and retry Move + Git Push")
-            self.show_error("Error", str(exc) + "\nRetry Move + Git Push to resume safely.")
+            self.set_status("Error")
+            self.show_error("Error", str(exc) + "\nUse Resume to retry safely.")
+        finally:
+            self.operation = None
+            if operation:
+                operation.close()
 
 
     def create_empty_directories(self, src: Path, dst: Path) -> None:
@@ -738,13 +859,13 @@ class FileMoverGitApp:
         :param dst: destination folder
         :returns: nothing
         """
-        for root_dir, dirnames, filenames in os.walk(src):
-            root_path = Path(root_dir)
-            rel_dir = root_path.relative_to(src)
-            target_dir = dst / rel_dir
-            if not filenames and not dirnames:
-                target_dir.mkdir(parents=True, exist_ok=True)
-                self.log(f"Created empty folder: {rel_dir}")
+        for path, is_directory in walk_entries(src):
+            if is_directory:
+                with os.scandir(path) as entries:
+                    empty = next(entries, None) is None
+                if empty:
+                    (dst / path.relative_to(src)).mkdir(parents=True, exist_ok=True)
+                    self.log(f"Created empty folder: {path.relative_to(src)}")
 
 
     def cleanup_empty_source_dirs(self, src: Path) -> None:
@@ -753,16 +874,15 @@ class FileMoverGitApp:
         :param src: source folder
         :returns: nothing
         """
-        for root_dir, _dirnames, _filenames in os.walk(src, topdown=False):
-            root_path = Path(root_dir)
-            if root_path == src:
-                continue
-            try:
-                if not any(root_path.iterdir()):
-                    root_path.rmdir()
-                    self.log(f"Removed empty source folder: {root_path.relative_to(src)}")
-            except OSError:
-                pass
+        if not src.is_dir():
+            return
+        for path, is_directory in walk_entries(src, bottom_up=True):
+            if is_directory:
+                try:
+                    path.rmdir()
+                    self.log(f"Removed empty source folder: {path.relative_to(src)}")
+                except OSError:
+                    pass
 
 
     def run_git_sequence(
