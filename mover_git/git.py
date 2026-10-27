@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from mover_git.core import MAX_BATCH_SIZE_BYTES, MAX_FILE_SIZE_BYTES, human_size
-from mover_git.storage import DiskSet, records, remove_journal
+from mover_git.storage import DiskSet, OperationLease, records, remove_journal
 
 PUSH_BUDGET_BYTES = 1024**3
 GIT_CONFIG = ["-c", "maintenance.auto=false", "-c", "gc.auto=0",
@@ -142,6 +142,12 @@ def object_bytes(repo: Path, commit: str, previous: str) -> int:
 def push_unpublished(repo: Path, branch: str, progress=lambda message: None,
                      budget: int = PUSH_BUDGET_BYTES, max_attempts: int = 4,
                      check_cancel=lambda: None) -> None:
+    # Shared with discard, including direct/legacy publication outside BatchOperation.
+    with OperationLease(pending_git_file(repo).parent / "mover-push.lock"):
+        return _push_unpublished(repo, branch, progress, budget, max_attempts, check_cancel)
+
+
+def _push_unpublished(repo, branch, progress, budget, max_attempts, check_cancel):
     """Publish fast-forward checkpoints, using remote refs as durable acknowledgements."""
     if not 0 < budget <= PUSH_BUDGET_BYTES or max_attempts < 1:
         raise ValueError("Push budget must be at most 1 GiB and attempts must be positive")

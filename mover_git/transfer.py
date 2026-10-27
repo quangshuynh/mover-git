@@ -191,6 +191,9 @@ def finish_transfer(repo: Path, journal: Path, progress=lambda message: None,
 
 
 def resume_transfers(repo: Path, branch: str, progress=lambda message: None) -> bool:
+    from mover_git.discard import recover_discard
+
+    recover_discard(repo)
     if operation_file(repo).exists():
         operation = BatchOperation(repo)
         try:
@@ -231,6 +234,8 @@ class BatchOperation:
 
     def __init__(self, repo: Path):
         self.repo = repo.resolve()
+        if (pending_git_file(repo).parent / "mover-discard.json").exists():
+            raise RuntimeError("Confirmed discard needs startup recovery before opening this job")
         self.db = sqlite3.connect(operation_file(repo))
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
@@ -247,6 +252,9 @@ class BatchOperation:
 
     @classmethod
     def create(cls, repo, pairs, branch, prefix="update", max_files=None):
+        from mover_git.discard import recover_discard
+
+        recover_discard(repo)
         with OperationLease(operation_file(repo).with_suffix(".lock")):
             return cls._create(repo, pairs, branch, prefix, max_files)
 
