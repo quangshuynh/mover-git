@@ -19,6 +19,7 @@ from mover_git.core import (
     make_commit_message,
     validate_paths,
 )
+from mover_git.discard import discard_job, recover_discard
 from mover_git.git import (
     check_staging_support,
     normalize_github_url,
@@ -204,6 +205,9 @@ class FileMoverGitApp:
         self.cleanup_button = ttk.Button(cancel_frame, text="Clean Up Verified Copies",
                                           command=self.cleanup_in_thread, state="disabled")
         self.cleanup_button.pack(side="left", padx=8)
+        self.discard_button = ttk.Button(cancel_frame, text="Discard Canceled Job",
+                                         command=self.discard_in_thread, state="disabled")
+        self.discard_button.pack(side="left", padx=8)
 
         summary_frame = ttk.LabelFrame(outer, text="Summary", padding=10)
         summary_frame.pack(fill="x", pady=(10, 0))
@@ -351,13 +355,44 @@ class FileMoverGitApp:
                     self.ui(self.root.destroy)
         threading.Thread(target=worker, daemon=False).start()
 
+    def discard_in_thread(self):
+        if self.is_busy or not self.pending_operation or not self.cancellation_finalized:
+            return
+        repo = self.saved_operation_repo
+        previous_status = self.cancellation_status
+        self.set_busy(True, "Reviewing Discard")
+
+        def worker():
+            try:
+                archive = discard_job(repo, lambda summary: self.ask_yes_no(
+                    "Discard Canceled Job — Abandon Transfer", summary))
+                if archive is None:
+                    self.set_status(previous_status)
+                    return
+                self.pending_operation = False
+                self.cancellation_finalized = False
+                self.recovery_requested = False
+                self.pause_event.clear()
+                self.set_status("Ready")
+                self.log(f"Canceled job discarded. Recovery records: {archive}")
+                self.show_info("Canceled job discarded", f"Recovery records preserved at:\n{archive}"
+                               "\nCorrect the folders and scan to start a new transfer.")
+            except Exception as exc:
+                self.set_status(previous_status)
+                self.show_error("Discard unavailable", str(exc))
+            finally:
+                self.set_busy(False)
+                if self.close_after_pause:
+                    self.ui(self.root.destroy)
+        threading.Thread(target=worker, daemon=False).start()
+
     def request_pause(self):
         self.pause_event.set()
         self.set_status("Pause Requested")
         self.pause_button.configure(state="disabled")
 
     def request_close(self):
-        if self.last_status in ("Cancel Requested", "Finalizing") and self.is_busy:
+        if self.last_status in ("Cancel Requested", "Finalizing", "Reviewing Discard") and self.is_busy:
             self.close_after_pause = True
         elif not self.is_busy:
             self.root.destroy()
@@ -380,6 +415,9 @@ class FileMoverGitApp:
 
     def detect_pending(self):
         repo = Path(self.dest_var.get())
+        archive = recover_discard(repo)
+        if archive:
+            self.log(f"Completed confirmed discard. Recovery records: {archive}")
         self.pending_operation = False
         self.cancellation_finalized = False
         self.saved_operation_repo = repo.resolve()
@@ -606,7 +644,7 @@ class FileMoverGitApp:
             self.set_status(status)
 
     def update_cancel_controls(self, status):
-        processing = status in ("Cancel Requested", "Finalizing")
+        processing = status in ("Cancel Requested", "Finalizing", "Reviewing Discard")
         available = ((getattr(self, "operation", None) is not None or
                       (self.pending_operation and not self.is_busy))
                      and not getattr(self, "cancellation_finalized", False))
@@ -620,6 +658,10 @@ class FileMoverGitApp:
                     not self.is_busy and (status == "Cleanup Available" or
                     (getattr(self, "cancellation_finalized", False) and
                      getattr(self, "cancellation_status", None) == "Cleanup Available")) else "disabled")
+        if hasattr(self, "discard_button"):
+            self.ui(self.discard_button.configure, state="normal" if
+                    not self.is_busy and self.pending_operation and
+                    getattr(self, "cancellation_finalized", False) else "disabled")
         if processing:
             for widget in (self.pause_button, self.resume_button, self.max_files_entry,
                            self.limit_button):
@@ -915,6 +957,7 @@ class FileMoverGitApp:
             if recovering:
                 repo_root = getattr(self, "saved_operation_repo", repo_root)
                 self.recovery_requested = False
+            recover_discard(repo_root)
             saved = operation_file(repo_root)
             if saved.exists():
                 operation = BatchOperation(repo_root)
@@ -923,16 +966,11 @@ class FileMoverGitApp:
                     operation = None
                     saved.unlink()
                 elif operation.cancel_mode() and not recovering:
-                    if not self.ask_yes_no("Use corrected folders", "Archive the canceled queue and "
-                                           "plan a new transfer with the current folder selections? "
-                                           "This requires safe cleanup first if copies remain. "
-                                           "Pending Git work must be resumed; it will not be discarded."):
-                        self.set_status(operation.state["status"])
-                        return
-                    archive = operation.retire()
-                    operation = None
-                    self.pending_operation = False
-                    self.log(f"Canceled queue archived for recovery: {archive}")
+                    self.set_status(operation.state["status"])
+                    self.show_info("Canceled job", "Choose Resume to recover the saved transfer, "
+                                   "Cleanup to remove verified copies, or Discard Canceled Job "
+                                   "to abandon it and start a new transfer.")
+                    return
             if operation is None:
                 if recovering or (getattr(self, "pending_operation", False) and not hasattr(self, "saved_operation_repo")):
                     resume_transfers(repo_root, self.remote_branch_var.get(), self.log)

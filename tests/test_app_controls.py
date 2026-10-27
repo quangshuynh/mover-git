@@ -168,3 +168,45 @@ def test_scan_after_cancel_keeps_folder_correction_available():
     app.set_busy(False)
     for widget in app.unsafe_widgets:
         widget.configure.assert_called_with(state='normal')
+
+
+def test_discard_is_separate_and_disabled_until_finalized():
+    app = controls()
+    app.discard_button = Mock()
+    app.set_busy(True, 'Cancel Requested')
+    app.discard_button.configure.assert_called_with(state='disabled')
+    app.set_busy(False, 'Canceled')
+    app.discard_button.configure.assert_called_with(state='normal')
+    app.set_busy(True, 'Reviewing Discard')
+    for widget in (app.discard_button, app.pause_button, app.resume_button, app.limit_button):
+        widget.configure.assert_called_with(state='disabled')
+
+
+@pytest.mark.parametrize('confirmed', [False, True])
+def test_discard_ui_requires_abandonment_confirmation_and_unlocks(monkeypatch, tmp_path, confirmed):
+    app = controls()
+    app.set_busy(False, 'Canceled')
+    app.saved_operation_repo = tmp_path
+    app.ask_yes_no = Mock(return_value=confirmed)
+    app.log, app.show_info, app.show_error = Mock(), Mock(), Mock()
+    app.discard_button = Mock()
+    monkeypatch.setattr('app.threading.Thread', lambda **kwargs: SimpleNamespace(start=kwargs['target']))
+
+    def discard(repository, confirm):
+        assert repository == tmp_path
+        return tmp_path / 'archive' if confirm('Changed commits and remote status') else None
+
+    monkeypatch.setattr('app.discard_job', discard)
+    app.discard_in_thread()
+    app.ask_yes_no.assert_called_once_with('Discard Canceled Job — Abandon Transfer',
+                                          'Changed commits and remote status')
+    assert app.pending_operation == (not confirmed)
+    assert not app.is_busy
+    app.show_error.assert_not_called()
+    if confirmed:
+        assert app.last_status == 'Ready'
+        app.scan_button.configure.assert_called_with(state='normal')
+        app.resume_button.configure.assert_called_with(state='disabled')
+        app.discard_button.configure.assert_called_with(state='disabled')
+        for widget in app.unsafe_widgets:
+            widget.configure.assert_called_with(state='normal')
