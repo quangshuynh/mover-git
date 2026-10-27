@@ -193,6 +193,18 @@ class FileMoverGitApp:
         ttk.Button(buttons_frame, text="Clear Log", command=self.clear_log).pack(side="left", padx=8)
         ttk.Button(buttons_frame, text="Show GitHub Link", command=self.show_github_link).pack(side="left", padx=8)
 
+        cancel_frame = ttk.Frame(outer)
+        cancel_frame.pack(fill="x", pady=(6, 0))
+        self.cancel_batch_button = ttk.Button(cancel_frame, text="Cancel Current Batch",
+                                              command=lambda: self.request_cancel("batch"), state="disabled")
+        self.cancel_batch_button.pack(side="left", padx=8)
+        self.cancel_transfer_button = ttk.Button(cancel_frame, text="Cancel Entire Transfer",
+                                                 command=lambda: self.request_cancel("transfer"), state="disabled")
+        self.cancel_transfer_button.pack(side="left", padx=8)
+        self.cleanup_button = ttk.Button(cancel_frame, text="Clean Up Verified Copies",
+                                          command=self.cleanup_in_thread, state="disabled")
+        self.cleanup_button.pack(side="left", padx=8)
+
         summary_frame = ttk.LabelFrame(outer, text="Summary", padding=10)
         summary_frame.pack(fill="x", pady=(10, 0))
         summary_container = ttk.Frame(summary_frame)
@@ -259,8 +271,9 @@ class FileMoverGitApp:
             operation = self.operation
             if operation:
                 operation.set_limit(value)
-            elif self.pending_operation and operation_file(Path(self.dest_var.get())).exists():
-                operation = BatchOperation(Path(self.dest_var.get()))
+            elif self.pending_operation and operation_file(getattr(
+                    self, "saved_operation_repo", Path(self.dest_var.get()))).exists():
+                operation = BatchOperation(getattr(self, "saved_operation_repo", Path(self.dest_var.get())))
                 try:
                     operation.set_limit(value)
                 finally:
@@ -274,13 +287,79 @@ class FileMoverGitApp:
             self.show_error("Invalid file limit", str(exc))
             return False
 
+    def request_cancel(self, mode):
+        operation = self.operation
+        owned = operation is None
+        previous_status = self.last_status
+        try:
+            if owned:
+                operation = BatchOperation(self.saved_operation_repo)
+            if mode == "transfer" and not messagebox.askyesno(
+                    "Cancel Entire Transfer", operation.cancellation_summary() +
+                    "\nStop safely and prevent remaining batches from starting?"):
+                return
+            self.set_status("Cancel Requested")
+            operation.request_cancel(mode)
+            if owned:
+                self.set_busy(True, "Finalizing")
+                self.recovery_requested = True
+                threading.Thread(target=self._move_worker, daemon=False).start()
+            else:
+                self.root.after(100, self.finish_requested_cancel)
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            self.set_status(previous_status)
+            self.show_error("Cancellation unavailable", str(exc))
+        finally:
+            if owned and operation:
+                operation.close()
+
+    def finish_requested_cancel(self):
+        # A confirmation dialog can outlive the worker it originally referred to.
+        if self.last_status not in ("Cancel Requested", "Finalizing"):
+            return
+        if self.is_busy:
+            self.root.after(100, self.finish_requested_cancel)
+            return
+        self.pending_operation = True
+        self.recovery_requested = True
+        self.set_busy(True, "Finalizing")
+        threading.Thread(target=self._move_worker, daemon=False).start()
+
+    def cleanup_in_thread(self):
+        if self.is_busy or not messagebox.askyesno(
+                "Clean Up Verified Copies", "Delete only journal-owned, uncommitted copies whose "
+                "original sources and destination hashes still match? Uncertain files are preserved."):
+            return
+        repo = self.saved_operation_repo
+        self.set_busy(True, "Finalizing")
+
+        def worker():
+            operation = None
+            try:
+                operation = BatchOperation(repo)
+                operation.cleanup(self.log)
+                self.set_status(operation.state["status"])
+            except Exception as exc:
+                self.log(f"Cleanup preserved files requiring review: {exc}")
+                self.set_status("Canceled")
+                self.show_error("Cleanup unavailable", str(exc))
+            finally:
+                if operation:
+                    operation.close()
+                self.set_busy(False)
+                if self.close_after_pause:
+                    self.ui(self.root.destroy)
+        threading.Thread(target=worker, daemon=False).start()
+
     def request_pause(self):
         self.pause_event.set()
         self.set_status("Pause Requested")
         self.pause_button.configure(state="disabled")
 
     def request_close(self):
-        if not self.is_busy:
+        if self.last_status in ("Cancel Requested", "Finalizing") and self.is_busy:
+            self.close_after_pause = True
+        elif not self.is_busy:
             self.root.destroy()
         elif messagebox.askyesno("Operation running", "Pause safely and close when the current "
                                 "batch is verified? Choose No to continue working."):
@@ -301,9 +380,15 @@ class FileMoverGitApp:
 
     def detect_pending(self):
         repo = Path(self.dest_var.get())
+        self.pending_operation = False
+        self.cancellation_finalized = False
+        self.saved_operation_repo = repo.resolve()
         if operation_file(repo).exists():
             operation = BatchOperation(repo)
             try:
+                self.saved_operation_repo = repo.resolve()
+                canceled = bool(operation.cancel_mode())
+                saved_status = operation.state["status"]
                 self.pending_operation = operation.state["status"] != "Complete"
                 self.remote_branch_var.set(operation.state["branch"])
                 self.max_files = operation.max_files
@@ -311,6 +396,14 @@ class FileMoverGitApp:
             finally:
                 operation.close()
             if self.pending_operation:
+                if canceled:
+                    if saved_status in ("Canceled", "Cleanup Available"):
+                        self.set_busy(False, saved_status)
+                    else:
+                        self.recovery_requested = True
+                        self.set_busy(True, "Finalizing")
+                        threading.Thread(target=self._move_worker, daemon=False).start()
+                    return
                 self.set_busy(False, "Paused")
                 if messagebox.askyesno("Pending transfer", "A saved transfer is pending. Resume "
                                       "after checking local and remote Git state?"):
@@ -326,10 +419,24 @@ class FileMoverGitApp:
             if messagebox.askyesno("Pending transfer", "An earlier transfer needs recovery. "
                                   "Verify and resume its Git work?"):
                 self.resume_in_thread()
+        else:
+            self.set_busy(False, "Ready")
 
     def resume_in_thread(self):
         if self.is_busy or not self.apply_limit():
             return
+        repo = getattr(self, "saved_operation_repo", Path(self.dest_var.get()))
+        if operation_file(repo).exists():
+            operation = BatchOperation(repo)
+            try:
+                if operation.cancel_mode():
+                    if not messagebox.askyesno("Resume saved transfer", operation.cancellation_summary() +
+                                              "\nResume these saved paths? Current folder selections are ignored."):
+                        return
+                    operation.resume()
+            finally:
+                operation.close()
+        self.recovery_requested = True
         self.pause_event.clear()
         self.set_busy(True, "Resuming")
         threading.Thread(target=self._move_worker, daemon=False).start()
@@ -428,7 +535,7 @@ class FileMoverGitApp:
         start the scan process in a background thread
         :returns: nothing
         """
-        if self.is_busy or self.pending_operation:
+        if self.is_busy or (self.pending_operation and not getattr(self, "cancellation_finalized", False)):
             return
         self.set_busy(True, "Scanning")
         threading.Thread(target=self._scan_worker, daemon=False).start()
@@ -439,7 +546,7 @@ class FileMoverGitApp:
         start the move and push process in a background thread
         :returns: nothing
         """
-        if self.is_busy or self.pending_operation or not self.apply_limit():
+        if self.is_busy or (self.pending_operation and not getattr(self, "cancellation_finalized", False)) or not self.apply_limit():
             return
         self.pause_event.clear()
         self.set_busy(True, "Running")
@@ -470,7 +577,7 @@ class FileMoverGitApp:
             self.move_and_push()
         finally:
             self.set_busy(False)
-            if self.close_after_pause and self.last_status in ("Paused", "Complete"):
+            if self.close_after_pause and self.last_status in ("Paused", "Complete", "Canceled", "Cleanup Available"):
                 self.ui(self.root.destroy)
             self.close_after_pause = False
 
@@ -482,7 +589,9 @@ class FileMoverGitApp:
         :returns: nothing
         """
         self.is_busy = busy
-        state = "disabled" if busy or self.pending_operation else "normal"
+        current_status = status or self.last_status
+        canceled = current_status in ("Canceled", "Cleanup Available") or getattr(self, "cancellation_finalized", False)
+        state = "disabled" if busy or (self.pending_operation and not canceled) else "normal"
         self.ui(self.scan_button.configure, state=state)
         self.ui(self.move_button.configure, state=state)
         for widget in self.unsafe_widgets:
@@ -492,8 +601,29 @@ class FileMoverGitApp:
                 state="normal" if self.pending_operation and not busy else "disabled")
         for widget in (self.max_files_entry, self.limit_button):
             self.ui(widget.configure, state="disabled" if busy and status == "Scanning" else "normal")
+        self.update_cancel_controls(current_status)
         if status is not None:
             self.set_status(status)
+
+    def update_cancel_controls(self, status):
+        processing = status in ("Cancel Requested", "Finalizing")
+        available = ((getattr(self, "operation", None) is not None or
+                      (self.pending_operation and not self.is_busy))
+                     and not getattr(self, "cancellation_finalized", False))
+        for name in ("cancel_batch_button", "cancel_transfer_button"):
+            if hasattr(self, name):
+                self.ui(getattr(self, name).configure,
+                        state="normal" if available and not processing and status not in
+                        ("Canceled", "Cleanup Available") else "disabled")
+        if hasattr(self, "cleanup_button"):
+            self.ui(self.cleanup_button.configure, state="normal" if
+                    not self.is_busy and (status == "Cleanup Available" or
+                    (getattr(self, "cancellation_finalized", False) and
+                     getattr(self, "cancellation_status", None) == "Cleanup Available")) else "disabled")
+        if processing:
+            for widget in (self.pause_button, self.resume_button, self.max_files_entry,
+                           self.limit_button):
+                self.ui(widget.configure, state="disabled")
 
     def set_status(self, status: str) -> None:
         """
@@ -502,6 +632,12 @@ class FileMoverGitApp:
         :returns: nothing
         """
         self.last_status = status
+        if status in ("Canceled", "Cleanup Available"):
+            self.cancellation_finalized = True
+            self.cancellation_status = status
+        elif status in ("Cancel Requested", "Finalizing", "Resuming", "Complete"):
+            self.cancellation_finalized = False
+        self.update_cancel_controls(status)
         self.ui(self.status_label.configure, text=f"Status: {status}")
         self.ui(self.root.title, f"File Mover + Git Push | {status}")
 
@@ -775,6 +911,10 @@ class FileMoverGitApp:
         operation = None
         try:
             repo_root = Path(self.dest_var.get()).resolve()
+            recovering = getattr(self, "recovery_requested", False)
+            if recovering:
+                repo_root = getattr(self, "saved_operation_repo", repo_root)
+                self.recovery_requested = False
             saved = operation_file(repo_root)
             if saved.exists():
                 operation = BatchOperation(repo_root)
@@ -782,8 +922,19 @@ class FileMoverGitApp:
                     operation.close()
                     operation = None
                     saved.unlink()
+                elif operation.cancel_mode() and not recovering:
+                    if not self.ask_yes_no("Use corrected folders", "Archive the canceled queue and "
+                                           "plan a new transfer with the current folder selections? "
+                                           "This requires safe cleanup first if copies remain. "
+                                           "Pending Git work must be resumed; it will not be discarded."):
+                        self.set_status(operation.state["status"])
+                        return
+                    archive = operation.retire()
+                    operation = None
+                    self.pending_operation = False
+                    self.log(f"Canceled queue archived for recovery: {archive}")
             if operation is None:
-                if getattr(self, "pending_operation", False):
+                if recovering or (getattr(self, "pending_operation", False) and not hasattr(self, "saved_operation_repo")):
                     resume_transfers(repo_root, self.remote_branch_var.get(), self.log)
                     self.pending_operation = False
                     self.set_status("Complete")
@@ -815,8 +966,11 @@ class FileMoverGitApp:
                     operation = BatchOperation.create(repo_root, pairs, branch,
                                                        self.commit_prefix_var.get() or "update",
                                                        self.max_files)
+                operation.state["source_root"] = str(src)
+                operation.save()
             self.pending_operation = True
             self.operation = operation
+            self.saved_operation_repo = repo_root
             operation.pause = self.pause_event
             operation.set_limit(self.max_files)
             self.progress_total_files, self.total_valid_size = operation.db.execute(
@@ -833,18 +987,22 @@ class FileMoverGitApp:
                 self.set_status(value)
 
             def progress(message):
-                if self.pause_event.is_set():
+                if self.pause_event.is_set() and not operation.cancel_mode():
                     self.set_status("Finishing Batch")
                 self.log(message)
 
             operation.run(progress, status)
             if operation.state["status"] == "Complete":
                 self.pending_operation = False
-                self.cleanup_empty_source_dirs(Path(self.source_var.get()))
+                if operation.state.get("source_root"):
+                    self.cleanup_empty_source_dirs(Path(operation.state["source_root"]))
                 self.show_info("Done", "Move and verified git push completed.")
         except Exception as exc:
             self.log(f"ERROR: {exc}")
-            self.set_status("Error")
+            if operation and operation.cancel_mode():
+                self.set_status(operation.state["status"])
+            else:
+                self.set_status("Error")
             self.show_error("Error", str(exc) + "\nUse Resume to retry safely.")
         finally:
             self.operation = None

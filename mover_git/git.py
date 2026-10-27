@@ -140,7 +140,8 @@ def object_bytes(repo: Path, commit: str, previous: str) -> int:
 
 
 def push_unpublished(repo: Path, branch: str, progress=lambda message: None,
-                     budget: int = PUSH_BUDGET_BYTES, max_attempts: int = 4) -> None:
+                     budget: int = PUSH_BUDGET_BYTES, max_attempts: int = 4,
+                     check_cancel=lambda: None) -> None:
     """Publish fast-forward checkpoints, using remote refs as durable acknowledgements."""
     if not 0 < budget <= PUSH_BUDGET_BYTES or max_attempts < 1:
         raise ValueError("Push budget must be at most 1 GiB and attempts must be positive")
@@ -155,6 +156,7 @@ def push_unpublished(repo: Path, branch: str, progress=lambda message: None,
     failures = 0
     step_limit = None
     while True:
+        check_cancel()
         previous = remote_head(repo, branch)
         if previous == target:
             return
@@ -179,6 +181,7 @@ def push_unpublished(repo: Path, branch: str, progress=lambda message: None,
             base = previous
             for line in commits:
                 commit = line.decode().strip()
+                check_cancel()
                 size = object_bytes(repo, commit, base)
                 if total + size > budget:
                     if not count:
@@ -194,6 +197,7 @@ def push_unpublished(repo: Path, branch: str, progress=lambda message: None,
         if not checkpoint:
             raise RuntimeError("No publishable checkpoint; inspect local and remote history")
         progress(f"Push: {count} commit(s), {human_size(total)} objects -> {checkpoint[:8]}")
+        check_cancel()
         error = "Remote verification did not match the pushed checkpoint"
         try:
             _git(repo, "-c", "push.followTags=false", "push", "--no-follow-tags",
@@ -202,6 +206,7 @@ def push_unpublished(repo: Path, branch: str, progress=lambda message: None,
             error = str(exc)
         # A lost response can still mean the server accepted the push.
         verified = remote_head(repo, branch)
+        check_cancel()
         if verified == checkpoint:
             progress(f"Verified origin/{branch} at {checkpoint[:8]}")
             failures = 0
@@ -216,7 +221,8 @@ def push_unpublished(repo: Path, branch: str, progress=lambda message: None,
         progress(f"Push retry {failures}/{max_attempts}: at most {step_limit} commit(s). {error}")
 
 
-def finish_pending_git(repo: Path, progress=lambda message: None, push: bool = True) -> bool:
+def finish_pending_git(repo: Path, progress=lambda message: None, push: bool = True,
+                       checkpoint=lambda: None) -> bool:
     """Resume durable Git work without moving files or committing twice."""
     journal = pending_git_file(repo)
     if not journal.exists():
@@ -239,6 +245,7 @@ def finish_pending_git(repo: Path, progress=lambda message: None, push: bool = T
             pathspec = Path(folder) / "paths"
             with pathspec.open("wb") as stream:
                 for record in selected_records():
+                    checkpoint()
                     path, expected = record["path"], record["hash"]
                     actual = file_digest(repo / path)
                     if expected and (actual != expected or
@@ -247,7 +254,9 @@ def finish_pending_git(repo: Path, progress=lambda message: None, push: bool = T
                     selected.add(path)
                     stream.write(path.encode("utf-8") + b"\0")
             path_args = (f"--pathspec-from-file={pathspec}", "--pathspec-file-nul")
+            checkpoint()
             _git(repo, "--literal-pathspecs", "add", *path_args)
+            checkpoint()
             changed = False
             with tempfile.TemporaryFile() as names:
                 result = subprocess.run(["git", *GIT_CONFIG, "diff", "--cached", "--name-only", "-z"],
@@ -263,6 +272,7 @@ def finish_pending_git(repo: Path, progress=lambda message: None, push: bool = T
                         changed = True
                         break
             if changed:
+                checkpoint()
                 _git(repo, "--literal-pathspecs", "commit", "--quiet", "-m", state["message"], *path_args)
 
     else:
@@ -273,18 +283,20 @@ def finish_pending_git(repo: Path, progress=lambda message: None, push: bool = T
             raise RuntimeError(
                 "HEAD changed outside the pending transfer; inspect before retrying."
             )
+    checkpoint()
     if push:
-        push_unpublished(repo, state["branch"], progress)
+        push_unpublished(repo, state["branch"], progress, check_cancel=checkpoint)
     remove_journal(journal)
     return True
 
 
 def stage_commit_push(repo: Path, paths: list[Path], message: str, branch: str,
-                      progress=lambda message: None, push: bool = True) -> None:
+                      progress=lambda message: None, push: bool = True,
+                      checkpoint=lambda: None) -> None:
     journal = pending_git_file(repo)
     if journal.exists():
         pending = json.loads(journal.read_text(encoding="utf-8"))
-        finish_pending_git(repo, progress, push)
+        finish_pending_git(repo, progress, push, checkpoint=checkpoint)
         if (pending["message"], pending["branch"]) == (message, branch):
             return
     total = count = 0
@@ -292,6 +304,7 @@ def stage_commit_push(repo: Path, paths: list[Path], message: str, branch: str,
     temporary = manifest.with_suffix(".building")
     with DiskSet() as selected, temporary.open("w", encoding="utf-8") as stream:
         for candidate in paths:
+            checkpoint()
             path = candidate.resolve().relative_to(repo.resolve()).as_posix()
             if path in selected:
                 continue
@@ -314,4 +327,4 @@ def stage_commit_push(repo: Path, paths: list[Path], message: str, branch: str,
     state = {"message": message, "branch": branch,
              "head": head.stdout.decode().strip() if head.returncode == 0 else "", "count": count}
     write_journal(journal, state)
-    finish_pending_git(repo, progress, push)
+    finish_pending_git(repo, progress, push, checkpoint=checkpoint)

@@ -199,6 +199,8 @@ def test_recovery_blocks_changed_git_state(repo, change):
     elif change == "remote":
         run(repo, "remote", "set-url", "origin", "changed")
     else:
+        # The bare remote may use main as its default branch on this machine.
+        run(repo.parent / "remote.git", "config", "receive.denyDeleteCurrent", "ignore")
         run(repo, "push", "origin", ":main")
     reopened = transfer.BatchOperation(repo)
     with pytest.raises(RuntimeError):

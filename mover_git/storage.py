@@ -118,3 +118,4 @@ def records(state, journal):
 def remove_journal(journal):
     journal.unlink()
     journal.with_suffix(".jsonl").unlink(missing_ok=True)
+    journal.with_suffix(".owned").unlink(missing_ok=True)

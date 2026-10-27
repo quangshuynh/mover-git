@@ -93,3 +93,78 @@ def test_tk_controls_initialize_and_apply_limit(monkeypatch):
         assert str(app.limit_button["state"]) == "normal"
     finally:
         root.destroy()
+
+
+def test_cancel_controls_disable_processing_and_unlock_finalized_folders():
+    app = controls()
+    app.operation = Mock()
+    for name in ('cancel_batch_button', 'cancel_transfer_button', 'cleanup_button'):
+        setattr(app, name, Mock())
+    app.set_busy(True, 'Cancel Requested')
+    for widget in (app.cancel_batch_button, app.cancel_transfer_button, app.cleanup_button,
+                   app.pause_button, app.resume_button, app.limit_button, *app.unsafe_widgets):
+        widget.configure.assert_called_with(state='disabled')
+    app.set_busy(False, 'Cleanup Available')
+    app.cleanup_button.configure.assert_called_with(state='normal')
+    app.resume_button.configure.assert_called_with(state='normal')
+    for widget in app.unsafe_widgets:
+        widget.configure.assert_called_with(state='normal')
+
+
+def test_cancel_uses_saved_paths_with_wrong_folders_selected(repo, monkeypatch):
+    from test_operations import create_operation
+
+    from mover_git.transfer import BatchOperation
+
+    operation, pairs = create_operation(repo)
+    operation.close()
+    app = controls()
+    app.operation = None
+    app.saved_operation_repo = repo
+    app.source_var = SimpleNamespace(get=lambda: '/wrong/source')
+    app.dest_var = SimpleNamespace(get=lambda: '/wrong/destination')
+    app.show_error = Mock()
+    launched = []
+    monkeypatch.setattr('app.threading.Thread', lambda **kwargs: SimpleNamespace(
+        start=lambda: launched.append(kwargs)))
+    confirmations = []
+
+    def confirm(title, message):
+        confirmations.append(message)
+        return True
+
+    monkeypatch.setattr('app.messagebox.askyesno', confirm)
+    app.request_cancel('transfer')
+    assert str(pairs[0][0]) in confirmations[0]
+    assert str(repo) in confirmations[0]
+    assert 'Completed/pushed batches: 0' in confirmations[0]
+    assert '/wrong/' not in confirmations[0]
+    assert launched and app.recovery_requested
+    app.show_error.assert_not_called()
+    operation = BatchOperation(repo)
+    assert operation.cancel_mode() == 'transfer'
+    operation.run()
+    assert all(source.exists() and not dest.exists() for source, dest in pairs)
+    operation.close()
+
+
+def test_cancel_confirmation_outliving_worker_still_finalizes(monkeypatch):
+    app = controls()
+    app.is_busy = False
+    app.last_status = 'Cancel Requested'
+    launched = []
+    monkeypatch.setattr('app.threading.Thread', lambda **kwargs: SimpleNamespace(
+        start=lambda: launched.append(kwargs)))
+    app.finish_requested_cancel()
+    assert launched and app.recovery_requested
+    assert app.last_status == 'Finalizing'
+
+
+def test_scan_after_cancel_keeps_folder_correction_available():
+    app = controls()
+    app.set_busy(False, 'Canceled')
+    app.set_busy(True, 'Scanning')
+    app.set_status('Scan complete')
+    app.set_busy(False)
+    for widget in app.unsafe_widgets:
+        widget.configure.assert_called_with(state='normal')
