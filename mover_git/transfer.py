@@ -1,9 +1,12 @@
 """Recoverable, verified copies; source removal follows verified publication."""
 
+import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import tempfile
 import threading
 import uuid
 from contextlib import closing
@@ -11,6 +14,7 @@ from pathlib import Path
 
 from mover_git.core import MAX_BATCH_SIZE_BYTES, MAX_FILE_SIZE_BYTES, human_size
 from mover_git.git import (
+    GIT_CONFIG,
     _git,
     file_digest,
     finish_pending_git,
@@ -31,6 +35,120 @@ def digest(path: Path) -> str:
 
 def transfer_directory(repo: Path) -> Path:
     return pending_git_file(repo).parent / "mover-transfers"
+
+
+def stable_identity(stat):
+    """File identity and content metadata; excludes atime, which hashing may update."""
+    return (stat.st_dev, stat.st_ino, stat.st_mode, stat.st_nlink, stat.st_size,
+            stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def partial_path(repo: Path, journal: Path, record) -> Path:
+    """Journal-owned temporary copy; one name per destination directory and batch."""
+    return (repo / record["path"]).with_name(f".{journal.stem}.partial")
+
+
+# Attributes whose presence can make stored blobs differ from the verified file bytes.
+CONTENT_ATTRIBUTES = ("text", "eol", "crlf", "filter", "ident", "working-tree-encoding")
+
+
+def check_content_filters(repo: Path, state, journal: Path, checkpoint=lambda: None) -> None:
+    """Refuse to commit when Git conversion would store bytes other than the manifest's."""
+    with DiskSet() as flagged, tempfile.TemporaryFile() as names, \
+            tempfile.TemporaryFile() as output:
+        for record in records(state, journal):
+            names.write(record["path"].encode("utf-8") + b"\0")
+        names.seek(0)
+        result = subprocess.run(["git", *GIT_CONFIG, "check-attr", "-z", "--stdin",
+                                 *CONTENT_ATTRIBUTES], cwd=repo, stdin=names, stdout=output,
+                                stderr=subprocess.PIPE)
+        if result.returncode:
+            raise RuntimeError(result.stderr.decode(errors="replace").strip())
+        output.seek(0)
+        tokens, pending = [], b""
+        while chunk := output.read(65536):
+            parts = (pending + chunk).split(b"\0")
+            pending = parts.pop()
+            tokens.extend(parts)
+            while len(tokens) >= 3:
+                path, attribute, value = tokens[:3]
+                del tokens[:3]
+                if value != b"unspecified" and not (
+                        attribute in (b"text", b"crlf") and value == b"unset"):
+                    flagged.add(path.decode("utf-8"))
+        for record in records(state, journal):
+            if record["path"] not in flagged:
+                continue
+            checkpoint()
+            relative = record["path"]
+            if (_git(repo, "hash-object", "--", relative)
+                    != _git(repo, "hash-object", "--no-filters", "--", relative)):
+                raise RuntimeError(
+                    f"Git attributes or filters would alter {relative} when committed "
+                    "(.gitattributes text/eol/filter/ident/encoding), so the commit would not "
+                    "match the verified source. Nothing was committed and sources are preserved; "
+                    "mark these paths -text/-filter in .gitattributes or choose another "
+                    "destination, then resume or cancel and clean up.")
+
+
+def verify_committed(repo: Path, commit: str, state, journal: Path,
+                     checkpoint=lambda: None) -> None:
+    """Hash every committed blob (streamed) against the source manifest before publication."""
+    process = subprocess.Popen(["git", *GIT_CONFIG, "cat-file", "--batch"], cwd=repo,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL)
+    try:
+        for record in records(state, journal):
+            checkpoint()
+            relative = record["path"]
+            name = f"{commit}:{relative}"
+            if "\n" in relative:
+                name = _git(repo, "rev-parse", "--verify", "--end-of-options",
+                            name).decode().strip()
+            process.stdin.write(name.encode("utf-8") + b"\n")
+            process.stdin.flush()
+            header = process.stdout.readline().split()
+            if len(header) != 3 or header[1] != b"blob":
+                raise RuntimeError(f"Committed file is missing from {commit[:8]}: {relative}; "
+                                   "nothing was pushed and the source is preserved.")
+            remaining, checksum = int(header[2]), hashlib.sha256()
+            while remaining:
+                chunk = process.stdout.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise RuntimeError("Git object stream ended unexpectedly; source preserved")
+                checksum.update(chunk)
+                remaining -= len(chunk)
+            process.stdout.read(1)
+            if checksum.hexdigest() != record["hash"]:
+                raise RuntimeError(
+                    f"Committed content in {commit[:8]} does not match the verified source "
+                    f"manifest: {relative}. Git attributes or filters may have altered it. "
+                    "Nothing was pushed and the source is preserved; review the local commit.")
+    finally:
+        process.stdin.close()
+        process.stdout.close()
+        process.wait()
+    head = local_head(repo)
+    if head == commit:
+        return
+    # Later local commits must not have changed or removed transferred files.
+    with DiskSet() as changed, tempfile.TemporaryFile() as names:
+        result = subprocess.run(["git", *GIT_CONFIG, "diff-tree", "-r", "-z", "--no-renames",
+                                 "--name-only", commit, head], cwd=repo, stdout=names,
+                                stderr=subprocess.PIPE)
+        if result.returncode:
+            raise RuntimeError(result.stderr.decode(errors="replace").strip())
+        names.seek(0)
+        pending = b""
+        while chunk := names.read(65536):
+            parts = (pending + chunk).split(b"\0")
+            pending = parts.pop()
+            for part in parts:
+                changed.add(part.decode("utf-8"))
+        for record in records(state, journal):
+            if record["path"] in changed:
+                raise RuntimeError(f"Committed content differs from transfer: {record['path']}; "
+                                   "source preserved")
 
 
 def prepare_transfer(repo: Path, pairs, message: str, branch: str,
@@ -102,7 +220,12 @@ def finish_transfer(repo: Path, journal: Path, progress=lambda message: None,
         if not destination.resolve().is_relative_to(repo.resolve()):
             raise RuntimeError(f"Destination escaped repository: {destination}")
         expected = record["hash"]
+        temporary = partial_path(repo, journal, record)
         if destination.exists():
+            # Crash after hard-link publication: the temporary name is only a second link.
+            if (temporary.exists() and not temporary.is_symlink()
+                    and os.path.samefile(temporary, destination)):
+                temporary.unlink()
             if digest(destination) != expected:
                 raise RuntimeError(f"Destination differs from verified transfer: {destination}. "
                                    "Preserve both files and repair manually before retrying.")
@@ -111,11 +234,12 @@ def finish_transfer(repo: Path, journal: Path, progress=lambda message: None,
                 raise RuntimeError(f"Source missing or changed: {source}; restore before retrying")
             checkpoint()
             destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(f".{journal.stem}.partial")
             # Only the journal-owned temporary copy can be replaced on recovery.
             if temporary.is_symlink():
                 raise RuntimeError(f"Unexpected temporary symlink: {temporary}")
-            with source.open("rb") as incoming, temporary.open("wb") as outgoing:
+            # Unlink, never truncate: a stale temporary may share a published file's inode.
+            temporary.unlink(missing_ok=True)
+            with source.open("rb") as incoming, temporary.open("xb") as outgoing:
                 shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
                 outgoing.flush()
                 os.fsync(outgoing.fileno())
@@ -157,6 +281,7 @@ def finish_transfer(repo: Path, journal: Path, progress=lambda message: None,
             state.update(committed=True, commit=head)
             write_journal(journal, state)
     if not state["committed"]:
+        check_content_filters(repo, state, journal, checkpoint)
         stage_commit_push(repo, (repo / r["path"] for r in records(state, journal)), state["message"], state["branch"], progress, push=False, checkpoint=checkpoint)
         state["committed"] = True
         state["commit"] = _git(repo, "rev-parse", "HEAD").decode().strip()
@@ -165,13 +290,8 @@ def finish_transfer(repo: Path, journal: Path, progress=lambda message: None,
     if not push:
         return
     _git(repo, "merge-base", "--is-ancestor", state["commit"], "HEAD")
-    # A later commit may have removed/replaced a copied file. Do not delete its source.
-    for record in records(state, journal):
-        relative = record["path"]
-        blob = _git(repo, "hash-object", "--", relative).strip()
-        committed = _git(repo, "rev-parse", f"HEAD:{relative}").strip()
-        if blob != committed:
-            raise RuntimeError(f"Committed content differs from transfer: {relative}; source preserved")
+    # Publish only commits whose stored blobs hash to the verified source manifest.
+    verify_committed(repo, state["commit"], state, journal, checkpoint)
     checkpoint()
     push_unpublished(repo, state["branch"], progress, check_cancel=checkpoint)
     checkpoint()
@@ -343,11 +463,12 @@ class BatchOperation:
             if state["committed"] or pending_git_file(self.repo).exists() or local_head(self.repo) != self.state["head"]:
                 progress("Preserved: committed or pending Git work requires recovery; no rollback performed.")
                 return
+            preserved = self.remove_partials(journal, state, progress)
             ownership = journal.with_suffix(".owned")
             if not ownership.exists():
                 progress("Preserved: no durable file ownership evidence.")
+                self.save("Cleanup Available" if preserved else "Canceled")
                 return
-            preserved = False
             with closing(sqlite3.connect(ownership)) as owned:
                 if not owned.execute("SELECT 1 FROM sqlite_master WHERE name='published'").fetchone():
                     progress("Preserved: publication ownership was interrupted; resume to recover.")
@@ -374,7 +495,8 @@ class BatchOperation:
                                 or (local_head(self.repo) and _git(self.repo, "--literal-pathspecs",
                                     "ls-tree", "HEAD", "--", record["path"]))):
                             raise RuntimeError("ownership, source integrity, or uncommitted status not proven")
-                        if destination.lstat() != stat or source.stat() != source_stat:
+                        if (stable_identity(destination.lstat()) != stable_identity(stat) or
+                                stable_identity(source.stat()) != stable_identity(source_stat)):
                             raise RuntimeError("file changed during cleanup verification")
                         destination.unlink()
                         progress(f"Removed verified uncommitted copy: {destination}")
@@ -383,6 +505,52 @@ class BatchOperation:
                         progress(f"Preserved {destination}: {exc}")
             progress("Unverified partial files and journals remain available for recovery.")
             self.save("Cleanup Available" if preserved else "Canceled")
+
+    def remove_partials(self, journal, state, progress):
+        """Delete journal-owned temporary copies only when no data can depend on them.
+
+        A temporary is removable when it is merely a second link to a published copy, or
+        when every unpublished record in its directory still has an intact source.
+        """
+        preserved = False
+        with DiskSet() as found, DiskSet() as unsafe, DiskSet() as handled:
+            for record in records(state, journal):
+                temporary = partial_path(self.repo, journal, record)
+                if not (temporary.exists() or temporary.is_symlink()):
+                    continue
+                found.add(temporary)
+                destination = self.repo / record["path"]
+                if destination.exists() or destination.is_symlink():
+                    continue
+                source = Path(record["source"])
+                try:
+                    intact = (source.is_file() and not source.is_symlink()
+                              and digest(source) == record["hash"])
+                except OSError:
+                    intact = False
+                if not intact:
+                    unsafe.add(temporary)
+            for record in records(state, journal):
+                temporary = partial_path(self.repo, journal, record)
+                if temporary not in found or temporary in handled:
+                    continue
+                handled.add(temporary)
+                if (temporary in unsafe or temporary.is_symlink() or not temporary.is_file()
+                        or not temporary.resolve().is_relative_to(self.repo)
+                        or _git(self.repo, "--literal-pathspecs", "ls-files", "--",
+                                temporary.relative_to(self.repo).as_posix())):
+                    preserved = True
+                    progress(f"Preserved temporary copy {temporary}: an unpublished source is "
+                             "missing or changed, or the file is not a plain untracked file.")
+                    continue
+                temporary.unlink()
+                progress(f"Removed interrupted temporary copy: {temporary}")
+        return preserved
+
+    def partials_remain(self, journal, state):
+        return any(partial_path(self.repo, journal, record).exists()
+                   or partial_path(self.repo, journal, record).is_symlink()
+                   for record in records(state, journal))
 
     def retire(self):
         """Archive a canceled, untouched/cleaned queue before planning corrected paths."""
@@ -400,6 +568,9 @@ class BatchOperation:
                                              (self.repo / record["path"]).is_symlink()
                                              for record in records(state, journal)):
                     raise RuntimeError("Resume or safely clean up the saved copies before replanning")
+                if self.partials_remain(journal, state):
+                    raise RuntimeError("Interrupted temporary copies remain; run Cleanup or review "
+                                       "them before replanning")
             archive = operation_file(self.repo).parent / "mover-canceled" / uuid.uuid4().hex
             archive.mkdir(parents=True)
             with closing(sqlite3.connect(archive / "operation.sqlite")) as backup:
@@ -445,8 +616,19 @@ class BatchOperation:
             if message != transfer["message"].strip() or parents != self.state["head"]:
                 raise RuntimeError("HEAD changed outside the active batch")
         remote = remote_head(self.repo, branch)
-        if self.state.get("remote_commit") and not remote:
+        saved = self.state.get("remote_commit")
+        if saved and not remote:
             raise RuntimeError("Remote branch was deleted; review before resuming")
+        if saved and remote != saved:
+            # Pushing again would silently undo an external rewind or force-push.
+            try:
+                _git(self.repo, "merge-base", "--is-ancestor", saved, remote)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Remote branch was rewound or rewritten since the last verified batch "
+                    f"(expected {saved[:8]} or a descendant, found {remote[:8]}). Nothing was "
+                    "pushed. Fetch and review origin before resuming; local commits are "
+                    "preserved.") from exc
         if remote and remote != head:
             try:
                 _git(self.repo, "merge-base", "--is-ancestor", remote, head)

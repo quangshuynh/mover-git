@@ -44,7 +44,7 @@ Mover Git copies and hashes files first, then removes sources only after a verif
 
 The application validates paths, nesting, repository state, symbolic links, size limits, and destination collisions. Git staging uses explicit repository-relative pathspecs for files moved by Mover Git. It does not run `git add .`, reset unrelated work, or clean the repository.
 
-Use Pause After Current Batch to finish copying, committing, and verifying the current push before stopping. Resume continues the saved queue; reopening offers recovery after checking local and remote Git state. Conflicting files or changed Git history require manual review.
+Use Pause After Current Batch to finish copying, committing, and verifying the current push before stopping. Resume continues the saved queue; reopening offers recovery after checking local and remote Git state. Conflicting files or changed Git history require manual review. Before each push, committed files are hashed against the saved source manifest; Git attributes that would alter file bytes, and a remote branch rewound or rewritten since the last verified batch, stop the transfer with sources preserved.
 
 ## Media Organization
 
