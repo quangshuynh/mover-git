@@ -10,7 +10,8 @@ from mover_git.core import MAX_BATCH_SIZE_BYTES, MAX_FILE_SIZE_BYTES, human_size
 from mover_git.storage import DiskSet, OperationLease, records, remove_journal
 
 PUSH_BUDGET_BYTES = 1024**3
-GIT_CONFIG = ["-c", "maintenance.auto=false", "-c", "gc.auto=0",
+# core.autocrlf=false: commits must store the exact verified source bytes.
+GIT_CONFIG = ["-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "core.autocrlf=false",
               "-c", "core.bigFileThreshold=8m", "-c", "pack.windowMemory=64m",
               "-c", "pack.threads=2"]
 

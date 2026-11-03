@@ -478,7 +478,7 @@ def test_remote_hook_rejection_retains_source_and_can_resume(repo):
     source = repo.parent / "original.txt"
     source.write_text("precious")
     journal = transfer.prepare_transfer(repo, [(source, repo / "copy.txt")], "batch", "main")
-    with pytest.raises(RuntimeError, match="after 4 attempts.*policy rejection"):
+    with pytest.raises(RuntimeError, match="(?s)after 4 attempts.*policy rejection"):
         transfer.finish_transfer(repo, journal)
     assert source.read_text() == "precious"
     assert journal.exists()
